@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 from ._specs import ArrayOf, BitField, EnumSpec, Nested, Spec, resolve_spec
 
 _METHODS = (
-    "to_bytes", "from_bytes", "to_dict", "from_dict", "to_json", "from_json",
+    "to_bytes", "from_bytes", "unpack_from", "to_dict", "from_dict", "to_json", "from_json",
     "to_xml", "from_xml", "to_ctypes", "from_ctypes", "ctypes_type", "c_header", "sizeof",
 )
 
@@ -152,8 +152,18 @@ class Schema:
                 kw[f.name] = v
         return self._build(kw)
 
+    @staticmethod
+    def _as_bytes_like(data):
+        return data if isinstance(data, (bytes, bytearray)) else memoryview(data).cast("B")
+
+    def unpack_from(self, buffer, offset: int = 0):
+        """Like struct.unpack_from: read one object at `offset`; extra bytes after it are fine."""
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError(f"offset must be a non-negative int, got {offset!r}")
+        return self.unpack(self._as_bytes_like(buffer), offset)
+
     def from_bytes(self, data):
-        data = memoryview(data).cast("B") if not isinstance(data, (bytes, bytearray)) else data
+        data = self._as_bytes_like(data)
         if len(data) != self.size():
             raise ValueError(f"{self.cls.__name__} needs exactly {self.size()} bytes, got {len(data)}")
         return self.unpack(data, 0)
@@ -281,6 +291,7 @@ def firstclass(cls=None, /, *, byteorder: str = "little", align: bool = False, *
         dc.__firstclass__ = s
         dc.to_bytes = lambda self: s.pack(self)
         dc.from_bytes = staticmethod(s.from_bytes)
+        dc.unpack_from = staticmethod(s.unpack_from)
         dc.to_dict = lambda self: s.to_dict(self)
         dc.from_dict = staticmethod(s.from_dict)
         dc.to_json = lambda self, **kw: json.dumps(s.to_dict(self), **kw)

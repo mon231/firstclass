@@ -70,12 +70,39 @@ address only means something inside the same process. Sizes follow the platform
 | Method | |
 |---|---|
 | `obj.to_bytes()` / `Cls.from_bytes(data)` | binary; `from_bytes` needs exactly `sizeof()` bytes |
+| `Cls.unpack_from(buffer, offset=0)` | like `struct.unpack_from`: read one object at `offset`, trailing bytes are fine; any buffer type |
 | `Cls.sizeof()` | size in bytes |
 | `obj.to_dict()` / `Cls.from_dict(d)` | JSON-compatible dict (bytes as hex) |
 | `obj.to_json(**kw)` / `Cls.from_json(s)` | `kw` goes to `json.dumps` |
 | `obj.to_xml(indent=None)` / `Cls.from_xml(s)` | `<Packet><kind>1</kind>...</Packet>`, arrays as `<item>` |
 | `obj.to_ctypes()` / `Cls.from_ctypes(c)` / `Cls.ctypes_type()` | `ctypes.Structure` with matching layout |
 | `Cls.c_header()` | C source for the struct(s), nested ones first |
+
+## Import C/C++ headers
+
+```python
+from firstclass import from_header          # also: firstclass.from_header
+
+t = from_header("protocol.h")               # or from_header(text="struct P { ... };")
+pkt = t.Packet(1, True, ...)                # structs -> @firstclass classes
+t.Color.RED                                 # enums / enum class -> IntEnum
+t.constants["MAX_LEN"]                      # #defines, consts, enum members
+t.skipped                                   # {"name": "reason"} for anything not convertible
+```
+
+Understood: `struct`/`class`/`typedef struct`, nested and anonymous-member structs, `enum` and
+`enum class : type` (explicit values, implicit increments, constant expressions), bitfields, arrays
+(multi-dimensional, sizes from `#define`/enum/`const`/`sizeof`), `char[N]` -> `char_array`,
+`uint8_t[N]` -> `bytes_t`, pointers and function pointers (stored as addresses), `typedef`/`using`,
+`#define`/`#if`/`#ifdef`/`#elif` (preset macros with `defines={...}`), `namespace`, `extern "C"`,
+`#pragma pack(push/pop/N)` and `__attribute__((packed))`. Layout follows C: natural alignment
+padding unless the struct is packed; force it with `align=True/False`. Options: `byteorder`,
+`long_size` (size of C `long`; default is this machine's).
+
+Skipped with a reason instead of failing: unions, flexible array members, unnamed padding
+bitfields, inheritance, virtual members, unknown types (`#include`d headers are not read), `pack(2)`
+/`pack(4)`, `aligned(N)`, `long double`, empty structs, anything depending on a skipped struct.
+`char` enums are 32-bit like C unless `: type` is given.
 
 ## Layout options
 

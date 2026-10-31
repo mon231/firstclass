@@ -274,3 +274,42 @@ class Types(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnpackFrom(unittest.TestCase):
+    def test_offset_and_trailing_bytes(self):
+        a, b = Point(1, -2), Point(300, 4)
+        stream = b"\xff\xff" + a.to_bytes() + b.to_bytes() + b"tail"
+        self.assertEqual(Point.unpack_from(stream, 2), a)
+        self.assertEqual(Point.unpack_from(stream, 2 + Point.sizeof()), b)
+        self.assertEqual(Point.unpack_from(a.to_bytes()), a)  # default offset 0
+
+    def test_walk_a_stream(self):
+        pts = [Point(i, -i) for i in range(5)]
+        stream = b"".join(p.to_bytes() for p in pts)
+        got = [Point.unpack_from(stream, i * Point.sizeof()) for i in range(5)]
+        self.assertEqual(got, pts)
+
+    def test_buffer_types(self):
+        p = make_packet()
+        raw = b"\x00" * 3 + p.to_bytes()
+        for buf in (raw, bytearray(raw), memoryview(raw)):
+            self.assertEqual(Packet.unpack_from(buf, 3), p)
+        import array
+        self.assertEqual(Point.unpack_from(array.array("h", [7, 8])), Point(7, 8))
+
+    def test_too_short_and_bad_offset(self):
+        raw = Point(1, 2).to_bytes()
+        with self.assertRaises(ValueError):
+            Point.unpack_from(raw, 1)
+        with self.assertRaises(ValueError):
+            Point.unpack_from(raw, -1)
+        with self.assertRaises(ValueError):
+            Point.unpack_from(raw, 100)
+        with self.assertRaises(ValueError):
+            Point.unpack_from(raw, True)
+
+    def test_nested_and_aligned(self):
+        a = Aligned(1, 2, 3, 4, 5)
+        stream = b"\x00" * 5 + a.to_bytes()
+        self.assertEqual(Aligned.unpack_from(stream, 5), a)
