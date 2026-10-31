@@ -468,6 +468,70 @@ class SkipsGracefully(unittest.TestCase):
         self.assertEqual(list(t.structs), ["S"])
 
 
+class EnumUnderlying(unittest.TestCase):
+    H = """
+    typedef unsigned long long u64;
+    enum class A : uint64_t { X = 1, Big = 0x1FFFFFFFF };
+    enum class B : int8_t { N = -1, P = 5 };
+    enum class C : u64 { Z = 7 };
+    enum D : unsigned short { D1 = 2 };
+    enum class E : std::uint32_t { E1 };
+    enum class F : uint8_t;                 // opaque declaration, defined below
+    struct S { A a; B b; C c; D d; E e; F f; enum class A a2; uint8_t tail; };
+    enum class F : uint8_t { F1 = 200 };
+    """
+
+    def setUp(self):
+        self.t = from_header(text=self.H, align=False)
+
+    def test_field_sizes_follow_underlying_type(self):
+        self.assertEqual(self.t.skipped, {})
+        self.assertEqual(self.t.S.sizeof(), 8 + 1 + 8 + 2 + 4 + 1 + 8 + 1)
+
+    def test_bytes(self):
+        t = self.t
+        s = t.S(t.A.Big, t.B.N, t.C.Z, t.D.D1, t.E.E1, t.F.F1, t.A.X, 9)
+        want = (struct.pack("<Q", 0x1FFFFFFFF) + struct.pack("<b", -1) + struct.pack("<Q", 7)
+                + struct.pack("<H", 2) + struct.pack("<I", 0) + b"\xc8" + struct.pack("<Q", 1) + b"\x09")
+        self.assertEqual(s.to_bytes(), want)
+        self.assertEqual(t.S.from_bytes(want), s)
+
+    def test_aligned_layout_matches_ctypes(self):
+        t = from_header(text=self.H)
+
+        class Ref(ctypes.Structure):
+            _fields_ = [("a", ctypes.c_uint64), ("b", ctypes.c_int8), ("c", ctypes.c_uint64),
+                        ("d", ctypes.c_uint16), ("e", ctypes.c_uint32), ("f", ctypes.c_uint8),
+                        ("a2", ctypes.c_uint64), ("tail", ctypes.c_uint8)]
+        self.assertEqual(t.S.sizeof(), ctypes.sizeof(Ref))
+
+    def test_big_endian(self):
+        t = from_header(text=self.H, align=False, byteorder="big")
+        s = t.S(t.A.X, t.B.P, t.C.Z, t.D.D1, t.E.E1, t.F.F1, t.A.Big, 0)
+        self.assertEqual(s.to_bytes()[:8], struct.pack(">Q", 1))
+        self.assertEqual(t.S.from_bytes(s.to_bytes()), s)
+
+    def test_value_must_fit_underlying(self):
+        t = from_header(text="enum class F : uint8_t { F1 = 300 }; enum class G : float { G1 };")
+        self.assertIn("out of range", t.skipped["F"])
+        self.assertIn("integer", t.skipped["G"])
+
+    def test_unknown_underlying_type(self):
+        t = from_header(text="enum class H : mystery_t { H1 }; struct S { uint8_t a; };")
+        self.assertIn("unknown type mystery_t", t.skipped["H"])
+        self.assertEqual(list(t.structs), ["S"])
+
+    def test_typedef_enum_with_underlying_and_namespaced_use(self):
+        t = from_header(text="""
+            namespace n { enum class K : uint64_t { A = 1 }; }
+            typedef enum L : int16_t { L_NEG = -2 } L_t;
+            struct S { n::K k; L_t l; std::uint8_t b; };
+        """, align=False)
+        self.assertEqual(t.skipped, {})
+        self.assertEqual(t.S.sizeof(), 8 + 2 + 1)
+        self.assertIs(t.L, t.L_t)
+
+
 class Api(unittest.TestCase):
     H = "struct P { uint8_t a; uint16_t b; };"
 

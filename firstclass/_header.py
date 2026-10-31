@@ -612,6 +612,9 @@ class _Parser:
             elif not words:
                 words.append(tok.text)
                 self.i += 1
+                while self.is_op(self.i, "::") and self.i + 1 < len(t) and t[self.i + 1].kind == "id":
+                    words += ["::", t[self.i + 1].text]  # qualified name, resolved later
+                    self.i += 2
                 break
             else:
                 break
@@ -867,6 +870,9 @@ class _Builder:
     def lower(self, words, depth=0):
         """words -> (base, is_pointer, inner_dims)"""
         ctx = self.ctx
+        # `std::uint64_t` / `ns::Type` -> last component
+        words = tuple(w for i, w in enumerate(words)
+                      if w != "::" and not (i + 1 < len(words) and words[i + 1] == "::"))
         if depth > 16 or not words:
             raise _Skip("cannot resolve type")
         if len(words) == 1:
