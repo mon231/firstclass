@@ -36,6 +36,8 @@ class Ints:
 
 class RefInts(ctypes.Structure):
     _pack_ = 1
+    if sys.version_info >= (3, 14):
+        _layout_ = "ms"  # 3.14 warns when _pack_ is set without it
     _fields_ = [(n, getattr(ctypes, t)) for n, t in zip(
         "abcdefghijklmnopqrstuv",
         ["c_int8", "c_uint8", "c_int16", "c_uint16", "c_int32", "c_uint32", "c_int64", "c_uint64",
@@ -54,6 +56,8 @@ class WithPointers:
 
 class RefPointers(ctypes.Structure):
     _pack_ = 1
+    if sys.version_info >= (3, 14):
+        _layout_ = "ms"  # 3.14 warns when _pack_ is set without it
     _fields_ = [("tag", ctypes.c_uint8), ("raw", ctypes.c_void_p),
                 ("ints", ctypes.POINTER(ctypes.c_int)), ("name", ctypes.c_void_p),
                 ("after", ctypes.c_uint16)]
@@ -68,6 +72,8 @@ class Arrays:
 
 class RefArrays(ctypes.Structure):
     _pack_ = 1
+    if sys.version_info >= (3, 14):
+        _layout_ = "ms"  # 3.14 warns when _pack_ is set without it
     _fields_ = [("words", ctypes.c_uint16 * 3), ("text", ctypes.c_char * 5), ("raw", ctypes.c_ubyte * 2)]
 
 
