@@ -193,3 +193,7 @@ bitfields, `#pragma pack` structs) and uses the generated classes.
 ```
 python -m unittest discover -s tests
 ```
+
+The suite (about 450 tests, 40 s) includes random-class fuzzing of every conversion path, parser
+fuzzing, byte-for-byte checks against real packets, and layout checks against the system C compiler
+and `rustc` (skipped when they are not installed). CI runs it on Ubuntu for Python 3.10 to 3.14.

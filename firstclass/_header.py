@@ -73,7 +73,10 @@ def _int_value(text: str) -> int:
 
 def _match(toks: list[Tok], i: int) -> int:
     """Index of the bracket closing toks[i] ('(' '[' '{'), or the last index if unbalanced."""
-    open_, close = {"(": ("(", ")"), "[": ("[", "]"), "{": ("{", "}")}[toks[i].text]
+    pair = {"(": ("(", ")"), "[": ("[", "]"), "{": ("{", "}")}.get(toks[i].text)
+    if pair is None:  # not an opening bracket: nothing to match
+        return i
+    open_, close = pair
     depth = 0
     for j in range(i, len(toks)):
         if toks[j].kind == "op":
@@ -99,7 +102,10 @@ class _Expr:
     def value(self) -> int:
         if not self.t:
             raise _ExprError("empty expression")
-        v = self.ternary()
+        try:
+            v = self.ternary()
+        except RecursionError:
+            raise _ExprError("expression nested too deeply") from None
         if self.i != len(self.t):
             raise _ExprError(f"unexpected token {self.t[self.i].text!r}")
         return v
@@ -286,6 +292,7 @@ class _Ctx:
         self.typedefs: dict[str, TypedefDecl] = {}
         self.constants: dict[str, int] = {}
         self.pack = None
+        self.parse_error = None
         self.long_size = long_size
         self._anon = 0
 
@@ -570,7 +577,7 @@ class _Parser:
                 continue
             break
         self.i = self.statement_end(self.i)
-        if words and words[0] in ("struct", "enum", "union") and len(words) == 2 and words[1].startswith("_anon"):
+        if words and words[0] in ("struct", "enum", "union") and len(words) == 2 and (words[1] or "").startswith("_anon"):
             plain = next((d for d in decls if d[0] and not d[1] and not d[2]), None)
             if plain:
                 self.ctx.rename(words[1], plain[0])
@@ -752,7 +759,7 @@ class _Parser:
     def parse_field_stmt(self, decl):
         words = self.parse_specifiers()
         inline_anon = bool(words) and words[0] in ("struct", "union", "enum") and len(words) == 2 \
-            and words[1].startswith("_anon")
+            and (words[1] or "").startswith("_anon")
         if not words:
             decl.reason = decl.reason or "unsupported member declaration"
             return
@@ -1027,6 +1034,8 @@ def _assemble(ctx, byteorder, align) -> HeaderTypes:
     builder = _Builder(ctx, byteorder, align)
     result = HeaderTypes()
     result.constants = dict(ctx.constants)
+    if ctx.parse_error:
+        result.skipped["<input>"] = ctx.parse_error
     for name in list(ctx.structs):
         if name.startswith("_anon"):
             continue
@@ -1078,7 +1087,10 @@ def from_header(path=None, *, text=None, byteorder: str = "little", align: bool 
     ctx = _Ctx(long_size)
     pre = _Preprocessor(defines)
     toks = _fold_attributes(pre.run(text, ctx))
-    _Parser(toks, ctx).parse_all()
+    try:
+        _Parser(toks, ctx).parse_all()
+    except RecursionError:  # absurdly nested input: keep what was parsed before it
+        ctx.parse_error = "input nested too deeply to parse completely"
     for name, body in pre.macros.items():  # integer #defines are constants too
         if name not in ctx.constants:
             try:

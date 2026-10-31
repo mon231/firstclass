@@ -208,6 +208,32 @@ class BitfieldTests(unittest.TestCase):
         self.assertEqual(m.to_bytes(), bytes([0x0A]) + (0x5 | (0xABC << 4)).to_bytes(2, "little"))
         self.assertEqual(MixedStorage.from_bytes(m.to_bytes()), m)
 
+    def test_same_size_storage_shares_a_unit_even_if_signedness_differs(self):
+        @firstclass
+        class Fill:
+            a: bitfield[uint8_t, 8]
+            b: bitfield[uint8_t, 1]
+            c: bitfield[int8_t, 7]   # int8_t after uint8_t: same size, so same unit as b
+            d: uint16_t
+
+        class Ref(ctypes.Structure):
+            _pack_ = 1
+            if sys.version_info >= (3, 14):
+                _layout_ = "ms"
+            _fields_ = [("a", ctypes.c_uint8, 8), ("b", ctypes.c_uint8, 1), ("c", ctypes.c_int8, 7),
+                        ("d", ctypes.c_uint16)]
+        self.assertEqual(Fill.sizeof(), ctypes.sizeof(Ref))
+        f = Fill(255, 1, -64, 513)
+        self.assertEqual(f.to_bytes(), bytes(Ref(255, 1, -64, 513)))
+        self.assertEqual(Fill.from_bytes(f.to_bytes()), f)
+
+    def test_different_size_storage_starts_a_new_unit(self):
+        @firstclass
+        class Diff:
+            a: bitfield[uint8_t, 3]
+            b: bitfield[uint16_t, 3]
+        self.assertEqual(Diff.sizeof(), 3)
+
     def test_aligned(self):
         a = AlignedBits(1, 0xF, 0xABCDEF, 2)
         self.assertEqual(AlignedBits.sizeof(), 12)  # 1 + 3 pad + 4 + 1 + 3 pad

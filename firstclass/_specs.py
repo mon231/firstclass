@@ -12,7 +12,10 @@ import xml.etree.ElementTree as ET
 
 def _endian(ctype, bo):
     """The byte-swapped (or plain) variant of a ctypes simple type for struct byte order `bo`."""
-    return getattr(ctype, "__ctype_be__" if bo == ">" else "__ctype_le__", ctype)
+    try:
+        return getattr(ctype, "__ctype_be__" if bo == ">" else "__ctype_le__", ctype)
+    except TypeError:  # c_bool, c_char, ...: no swapped variant, and byte order is meaningless anyway
+        return ctype
 
 
 class Spec:
@@ -127,13 +130,15 @@ class Scalar(Spec):
         return self.check(int(text) if self.kind == "int" else float(text))
 
     def ctype(self, bo):
+        if self.kind == "bool" and bo != _NATIVE_BO:
+            return ctypes.c_uint8  # a swapped ctypes Structure rejects c_bool; same one-byte layout
         return _endian(self._ctype, bo)
 
     def to_c(self, value, bo):
         return self.check(value)
 
     def from_c(self, cvalue):
-        return cvalue
+        return bool(cvalue) if self.kind == "bool" else cvalue
 
     def c_decl(self, name):
         return f"{self.c_name} {name}"

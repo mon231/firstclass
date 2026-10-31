@@ -415,7 +415,7 @@ class _RustParser:
             for seg in _split_commas(t[k + 1:_match(t, k)]):
                 seg = self.strip_field_prefix(seg)
                 while seg and _is_op(seg, 0, "#"):
-                    seg = seg[_match(seg, 1) + 1:]
+                    seg = seg[_match(seg, 1) + 1:] if _is_op(seg, 1, "[") else seg[1:]
                 if not seg or seg[0].kind != "id":
                     continue
                 vname = seg[0].text
@@ -464,5 +464,8 @@ def from_rust(path=None, *, text=None, byteorder: str = "little", align: bool | 
     if byteorder not in ("little", "big"):
         raise ValueError(f"byteorder must be 'little' or 'big', got {byteorder!r}")
     ctx = _Ctx(long_size or ctypes.sizeof(ctypes.c_long))
-    _RustParser(_tokenize(text), ctx, assume_repr_c).parse_all()
+    try:
+        _RustParser(_tokenize(text), ctx, assume_repr_c).parse_all()
+    except RecursionError:  # absurdly nested input: keep what was parsed before it
+        ctx.parse_error = "input nested too deeply to parse completely"
     return _assemble(ctx, byteorder, align)

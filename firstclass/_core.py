@@ -63,7 +63,7 @@ class Schema:
             for i, (_, spec) in enumerate(self.fields):
                 if isinstance(spec, BitField):
                     st, unit = spec.storage, spec.storage.size() * 8
-                    if group is None or group[0].name != st.name or group[1] + spec.bits > unit:
+                    if group is None or group[0].size() != st.size() or group[1] + spec.bits > unit:
                         a = st.align() if self.aligned else 1
                         off = _round_up(off, a)
                         widest = max(widest, a)
