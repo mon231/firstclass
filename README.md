@@ -86,7 +86,7 @@ from firstclass import from_header          # also: firstclass.from_header
 t = from_header("protocol.h")               # or from_header(text="struct P { ... };")
 pkt = t.Packet(1, True, ...)                # structs -> @firstclass classes
 t.Color.RED                                 # enums / enum class -> IntEnum
-t.constants["MAX_LEN"]                      # #defines, consts, enum members
+t.constants["MAX_LEN"]                      # integer #defines, consts, enum members
 t.skipped                                   # {"name": "reason"} for anything not convertible
 ```
 
@@ -102,7 +102,8 @@ padding unless the struct is packed; force it with `align=True/False`. Options: 
 Skipped with a reason instead of failing: unions, flexible array members, unnamed padding
 bitfields, inheritance, virtual members, unknown types (`#include`d headers are not read), `pack(2)`
 /`pack(4)`, `aligned(N)`, `long double`, empty structs, anything depending on a skipped struct.
-`char` enums are 32-bit like C unless `: type` is given.
+Plain C enums are 32-bit like C unless `: type` is given. C field names that are Python keywords
+(`class`, `from`, ...) get a trailing underscore (`class_`).
 
 ## Layout options
 
@@ -128,7 +129,8 @@ in a comment.
 
 ## Example
 
-`python examples/example.py` shows bytes, JSON, XML, ctypes and the C header from one class.
+`python examples/example.py` defines a class in Python, then imports `examples/protocol.h` (enums, `enum class`,
+bitfields, `#pragma pack` structs) and uses the generated classes.
 
 ## Develop
 

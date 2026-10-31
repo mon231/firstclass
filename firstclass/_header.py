@@ -10,6 +10,7 @@ import ast
 import collections
 import ctypes
 import enum
+import keyword
 import os
 import re
 from pathlib import Path
@@ -935,7 +936,8 @@ class _Builder:
             if f.name in ann:
                 raise _Skip(f"duplicate field {f.name}")
             try:
-                ann[f.name] = self.annotation(f)
+                # C names that are Python keywords (class, from, ...) get a trailing underscore
+                ann[f.name + "_" if keyword.iskeyword(f.name) else f.name] = self.annotation(f)
             except (_Skip, TypeError, ValueError) as e:
                 raise _Skip(f"{decl.name}.{f.name}: {e}") from None
         cls = type(decl.name, (), {"__annotations__": ann, "__module__": "firstclass.header"})
@@ -1035,6 +1037,12 @@ def from_header(path=None, *, text=None, byteorder: str = "little", align: bool 
     pre = _Preprocessor(defines)
     toks = _fold_attributes(pre.run(text, ctx))
     _Parser(toks, ctx).parse_all()
+    for name, body in pre.macros.items():  # integer #defines are constants too
+        if name not in ctx.constants:
+            try:
+                ctx.constants[name] = ctx.eval(pre.expand(body, (name,)))
+            except (_ExprError, ValueError, KeyError):
+                pass
 
     builder = _Builder(ctx, byteorder, align)
     result = HeaderTypes()

@@ -100,7 +100,8 @@ class Schema:
         return {f.name: f for f, _ in self.fields}  # small; fields are cached
 
     def _ctx(self, f, exc):
-        return type(exc)(f"{self.cls.__name__}.{f.name}: {exc}")
+        kind = TypeError if isinstance(exc, TypeError) else ValueError  # e.g. UnicodeDecodeError -> ValueError
+        return kind(f"{self.cls.__name__}.{f.name}: {exc}")
 
     # -- bytes ---------------------------------------------------------------
 
@@ -283,6 +284,8 @@ def firstclass(cls=None, /, *, byteorder: str = "little", align: bool = False, *
     """
 
     def wrap(cls):
+        if not isinstance(cls, type):
+            raise TypeError(f"@firstclass needs a class, got {type(cls).__name__}")
         dc = dataclasses.dataclass(cls, **dataclass_kwargs)
         clash = [f.name for f in dataclasses.fields(dc) if f.name in _METHODS or f.name == "__firstclass__"]
         if clash:
@@ -297,7 +300,7 @@ def firstclass(cls=None, /, *, byteorder: str = "little", align: bool = False, *
         dc.to_json = lambda self, **kw: json.dumps(s.to_dict(self), **kw)
         dc.from_json = staticmethod(lambda text: s.from_dict(json.loads(text)))
         dc.to_xml = lambda self, indent=None: _to_xml(s, self, indent)
-        dc.from_xml = staticmethod(lambda text: s.read_xml(ET.fromstring(text)))
+        dc.from_xml = staticmethod(lambda text: s.read_xml(_parse_xml(text)))
         dc.to_ctypes = lambda self: s.to_ctypes(self)
         dc.from_ctypes = staticmethod(s.from_ctypes)
         dc.ctypes_type = staticmethod(s.ctypes_type)
@@ -306,6 +309,13 @@ def firstclass(cls=None, /, *, byteorder: str = "little", align: bool = False, *
         return dc
 
     return wrap if cls is None else wrap(cls)
+
+
+def _parse_xml(text):
+    try:
+        return ET.fromstring(text)
+    except ET.ParseError as e:
+        raise ValueError(f"malformed XML: {e}") from e
 
 
 def _to_xml(schema: Schema, obj, indent) -> str:
