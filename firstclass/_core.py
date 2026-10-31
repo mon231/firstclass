@@ -279,6 +279,9 @@ class Schema:
 def firstclass(cls=None, /, *, byteorder: str = "little", align: bool = False, **dataclass_kwargs):
     """Like `@dataclass` (same keyword args), plus binary/JSON/XML/ctypes/C codecs.
 
+    Unlike a plain dataclass, `order=True` is the default (compare field by field, like tuples);
+    pass `order=False` to turn it off.
+
     byteorder: 'little' (default) or 'big'.
     align: False (default) = packed layout, no padding; True = natural C alignment padding.
     """
@@ -286,7 +289,9 @@ def firstclass(cls=None, /, *, byteorder: str = "little", align: bool = False, *
     def wrap(cls):
         if not isinstance(cls, type):
             raise TypeError(f"@firstclass needs a class, got {type(cls).__name__}")
-        dc = dataclasses.dataclass(cls, **dataclass_kwargs)
+        kwargs = dict(dataclass_kwargs)
+        kwargs.setdefault("order", kwargs.get("eq", True))  # ==, <, <=, >, >= by field order
+        dc = dataclasses.dataclass(cls, **kwargs)
         clash = [f.name for f in dataclasses.fields(dc) if f.name in _METHODS or f.name == "__firstclass__"]
         if clash:
             raise TypeError(f"{dc.__name__}: field names clash with firstclass methods: {clash}")

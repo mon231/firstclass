@@ -105,6 +105,13 @@ bitfields, inheritance, virtual members, unknown types (`#include`d headers are 
 Plain C enums are 32-bit like C unless `: type` is given. C field names that are Python keywords
 (`class`, `from`, ...) get a trailing underscore (`class_`).
 
+## Comparison
+
+Like a dataclass, `==` / `!=` compare field by field. Unlike a plain dataclass, ordering is on by
+default: `<`, `<=`, `>`, `>=` compare fields in declaration order, like tuples, so you can `sorted()`,
+`min()` and `max()` instances. Comparing with another class raises `TypeError` (`==` is just `False`).
+Switch it off with `@firstclass(order=False)`; `eq=False` turns off both.
+
 ## Layout options
 
 ```python

@@ -323,7 +323,7 @@ class DataclassBehaviour(unittest.TestCase):
         self.assertEqual(s.to_bytes(), b"\xc8\x05")
 
     def test_decorator_forms(self):
-        self.assertTrue(dataclasses.is_dataclass(firstclass(Small)))
+        self.assertTrue(dataclasses.is_dataclass(firstclass(type("Fresh", (), {"__annotations__": {"a": uint8_t}}))))
         with self.assertRaises(TypeError):
             firstclass(5)
         with self.assertRaises(ValueError):
