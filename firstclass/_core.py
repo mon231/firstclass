@@ -8,7 +8,7 @@ import sys
 import typing
 import xml.etree.ElementTree as ET
 
-from ._specs import ArrayOf, Nested, Spec, resolve_spec
+from ._specs import ArrayOf, BitField, EnumSpec, Nested, Spec, resolve_spec
 
 _METHODS = (
     "to_bytes", "from_bytes", "to_dict", "from_dict", "to_json", "from_json",
@@ -50,16 +50,35 @@ class Schema:
                 )
 
     def layout(self):
+        """-> (items, total_size, widest_alignment).
+
+        An item is ("field", index, offset) or ("bits", storage_spec, offset, [(index, shift, bits)]).
+        """
         if self._layout is None:
             self.require_binary()
-            off, widest, offsets = 0, 1, []
-            for _, spec in self.fields:
+            msb = self.bo == ">"
+            off, widest, items, group = 0, 1, [], None  # group = [storage, used_bits, members]
+            for i, (_, spec) in enumerate(self.fields):
+                if isinstance(spec, BitField):
+                    st, unit = spec.storage, spec.storage.size() * 8
+                    if group is None or group[0].name != st.name or group[1] + spec.bits > unit:
+                        a = st.align() if self.aligned else 1
+                        off = _round_up(off, a)
+                        widest = max(widest, a)
+                        group = [st, 0, []]
+                        items.append(("bits", st, off, group[2]))
+                        off += st.size()
+                    shift = unit - group[1] - spec.bits if msb else group[1]
+                    group[2].append((i, shift, spec.bits))
+                    group[1] += spec.bits
+                    continue
+                group = None
                 a = spec.align() if self.aligned else 1
                 off = _round_up(off, a)
-                offsets.append(off)
+                items.append(("field", i, off))
                 off += spec.size()
                 widest = max(widest, a)
-            self._layout = (offsets, _round_up(off, widest), widest)
+            self._layout = (items, _round_up(off, widest), widest)
         return self._layout
 
     def size(self) -> int:
@@ -86,26 +105,51 @@ class Schema:
     # -- bytes ---------------------------------------------------------------
 
     def pack(self, obj) -> bytes:
-        offsets, total, _ = self.layout()
+        items, total, _ = self.layout()
         buf = bytearray(total)
-        for (f, spec), off in zip(self.fields, offsets):
-            try:
-                raw = spec.pack(getattr(obj, f.name), self.bo)
-            except (TypeError, ValueError) as e:
-                raise self._ctx(f, e) from e
-            buf[off:off + len(raw)] = raw
+        order = "little" if self.bo == "<" else "big"
+        for item in items:
+            if item[0] == "field":
+                f, spec = self.fields[item[1]]
+                try:
+                    raw = spec.pack(getattr(obj, f.name), self.bo)
+                except (TypeError, ValueError) as e:
+                    raise self._ctx(f, e) from e
+                buf[item[2]:item[2] + len(raw)] = raw
+                continue
+            _, st, off, members = item
+            unit = 0
+            for i, shift, bits in members:
+                f, spec = self.fields[i]
+                try:
+                    unit |= (spec.check(getattr(obj, f.name)) & ((1 << bits) - 1)) << shift
+                except (TypeError, ValueError) as e:
+                    raise self._ctx(f, e) from e
+            buf[off:off + st.size()] = unit.to_bytes(st.size(), order)
         return bytes(buf)
 
     def unpack(self, buf, off: int = 0):
-        offsets, total, _ = self.layout()
+        items, total, _ = self.layout()
         if len(buf) - off < total:
             raise ValueError(f"{self.cls.__name__} needs {total} bytes, got {len(buf) - off}")
+        order = "little" if self.bo == "<" else "big"
         kw = {}
-        for (f, spec), o in zip(self.fields, offsets):
-            try:
-                kw[f.name] = spec.unpack(buf, off + o, self.bo)
-            except (TypeError, ValueError) as e:
-                raise self._ctx(f, e) from e
+        for item in items:
+            if item[0] == "field":
+                f, spec = self.fields[item[1]]
+                try:
+                    kw[f.name] = spec.unpack(buf, off + item[2], self.bo)
+                except (TypeError, ValueError) as e:
+                    raise self._ctx(f, e) from e
+                continue
+            _, st, o, members = item
+            unit = int.from_bytes(bytes(buf[off + o:off + o + st.size()]), order)
+            for i, shift, bits in members:
+                f, spec = self.fields[i]
+                v = (unit >> shift) & ((1 << bits) - 1)
+                if spec.signed and v >> (bits - 1):
+                    v -= 1 << bits
+                kw[f.name] = v
         return self._build(kw)
 
     def from_bytes(self, data):
@@ -160,7 +204,11 @@ class Schema:
         if self._ctype is None:
             self.require_binary()
             base = ctypes.LittleEndianStructure if self.bo == "<" else ctypes.BigEndianStructure
-            ns = {"_fields_": [(f.name, spec.ctype(self.bo)) for f, spec in self.fields]}
+            ns = {"_fields_": [
+                (f.name, spec.ctype(self.bo), spec.bits) if isinstance(spec, BitField)
+                else (f.name, spec.ctype(self.bo))
+                for f, spec in self.fields
+            ]}
             if not self.aligned:
                 ns["_pack_"] = 1
                 if sys.version_info >= (3, 14):
@@ -197,6 +245,12 @@ class Schema:
             seen.add(schema.cls)
             for dep in schema._nested_schemas():
                 emit(dep)
+            for _, spec in schema.fields:
+                while isinstance(spec, ArrayOf):
+                    spec = spec.elem
+                if isinstance(spec, EnumSpec) and spec.cls not in seen:
+                    seen.add(spec.cls)
+                    out.append(spec.c_definition())
             lines = [f"/* byteorder: {schema.byteorder} */"]
             if not schema.aligned:
                 lines.append("#pragma pack(push, 1)")

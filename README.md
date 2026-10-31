@@ -40,10 +40,23 @@ Packet.sizeof()                    # 36
 | `char_array[N]` | `char x[N]` | N (UTF-8, NUL-padded) |
 | `bytes_t[N]` | `uint8_t x[N]` | N |
 | `array_t[T, N]` | `T x[N]` | N * size(T) |
+| `enum_t[Color, uint8_t]` | `uint8_t x` (+ `enum Color {..}` in header) | storage size |
+| `bitfield[uint8_t, 3]` | `uint8_t x : 3` | shares a storage unit |
 | another `@firstclass` class | `struct Name` | its size |
 
 Values are checked: out of range ints, over-long strings and wrong lengths raise
 `ValueError`; wrong Python types raise `TypeError`. Nothing is truncated or coerced silently.
+
+**Enums.** Int-valued `Enum`/`IntEnum`/`IntFlag` classes. `enum_t[Color, uint8_t]` picks the width;
+a bare `Color` annotation is 32-bit like a C `int` (unsigned unless a value is negative). Values
+are stored, and written to JSON/XML, as ints; reading an unknown value raises `ValueError`.
+`c_header()` emits `enum Color { Color_RED = 1, ... };`.
+
+**Bitfields.** `bitfield[uint8_t, 3]` is 3 bits of a `uint8_t` unit, like `uint8_t x : 3`.
+Neighbouring bitfields with the same storage type share a unit while they fit; otherwise a new
+unit starts. Little-endian fills from the lowest bit, big-endian from the highest (what ctypes
+does). Signed storage (`int8_t`) gives signed fields. Mixing storage types in one run is not
+portable across C compilers; keep a run on one type. No arrays of bitfields.
 
 Raw `ctypes` types work as annotations too (packed, same layout as a `_pack_ = 1` Structure):
 `ctypes.c_int`, `c_uint64`, `c_size_t`, `c_bool`, `c_float`, `c_double`, `c_char`, `c_uint16 * 4`,

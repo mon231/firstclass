@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import binascii
 import ctypes
+import enum
 import struct
 import sys
 from typing import Annotated, Any, get_origin
@@ -391,6 +392,130 @@ class Plain(Spec):
         raise TypeError(f"XML needs a firstclass type for {self.tp!r}")
 
 
+class BitField(Spec):
+    """`bitfield[uint8_t, 3]`: N bits of a storage int, like `uint8_t x : 3` in C.
+
+    Neighbouring bitfields with the same storage type share one storage unit while they fit
+    (little-endian: filled from the lowest bit; big-endian: from the highest bit, like ctypes).
+    The Schema does the grouping; this spec only validates values.
+    """
+
+    def __init__(self, storage: Scalar, bits: int):
+        if isinstance(storage, Pointer) or storage.kind != "int":
+            raise TypeError("bitfield storage must be an integer type like uint8_t")
+        if not 1 <= bits <= storage.size() * 8:
+            raise ValueError(f"bitfield width {bits} does not fit {storage.name}")
+        self.storage, self.bits = storage, bits
+        self.signed = storage.fmt.islower()
+        self.lo, self.hi = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if self.signed else (0, (1 << bits) - 1)
+
+    def align(self):
+        return self.storage.align()
+
+    def size(self):
+        return self.storage.size()
+
+    def check(self, value):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"bitfield needs int, got {type(value).__name__}")
+        if not self.lo <= value <= self.hi:
+            raise ValueError(f"{value} out of range for {self.bits}-bit {self.storage.name} [{self.lo}, {self.hi}]")
+        return value
+
+    def pack(self, value, bo):
+        raise TypeError("bitfields are packed by their containing class")
+
+    unpack = pack
+
+    def to_json(self, value):
+        return value
+
+    def from_json(self, obj):
+        return self.check(obj)
+
+    def to_xml(self, value, elem):
+        elem.text = str(value)
+
+    def from_xml(self, elem):
+        return self.check(int(_xml_text(elem).strip()))
+
+    def ctype(self, bo):
+        return self.storage.ctype(bo)
+
+    def to_c(self, value):
+        return self.check(value)
+
+    def from_c(self, cvalue):
+        return cvalue
+
+    def c_decl(self, name):
+        return f"{self.storage.c_name} {name} : {self.bits}"
+
+
+class EnumSpec(Spec):
+    """An `enum.Enum` (int-valued) stored as a fixed-width integer."""
+
+    def __init__(self, enum_cls, storage: Scalar):
+        if isinstance(storage, Pointer) or storage.kind != "int":
+            raise TypeError("enum storage must be an integer type like uint8_t")
+        for m in enum_cls:
+            if isinstance(m.value, bool) or not isinstance(m.value, int):
+                raise TypeError(f"{enum_cls.__name__}.{m.name}: only int-valued enums are supported")
+            storage.check(m.value)
+        self.cls, self.storage = enum_cls, storage
+
+    def align(self):
+        return self.storage.align()
+
+    def size(self):
+        return self.storage.size()
+
+    def check(self, value):
+        if not isinstance(value, self.cls):
+            raise TypeError(f"expected {self.cls.__name__}, got {type(value).__name__}")
+        self.storage.check(int(value.value))
+        return value
+
+    def _member(self, raw):
+        return self.cls(self.storage.check(raw))  # ValueError for unknown values
+
+    def pack(self, value, bo):
+        return self.storage.pack(int(self.check(value).value), bo)
+
+    def unpack(self, buf, off, bo):
+        return self._member(self.storage.unpack(buf, off, bo))
+
+    def to_json(self, value):
+        return int(value.value)
+
+    def from_json(self, obj):
+        return self._member(obj)
+
+    def to_xml(self, value, elem):
+        elem.text = str(int(value.value))
+
+    def from_xml(self, elem):
+        return self._member(int(_xml_text(elem).strip()))
+
+    def ctype(self, bo):
+        return self.storage.ctype(bo)
+
+    def to_c(self, value):
+        return int(self.check(value).value)
+
+    def from_c(self, cvalue):
+        return self._member(cvalue)
+
+    def c_decl(self, name):
+        return self.storage.c_decl(name)
+
+    def c_definition(self) -> str:
+        lines = [f"enum {self.cls.__name__} {{"]
+        lines += [f"    {self.cls.__name__}_{m.name} = {int(m.value)}," for m in self.cls]
+        lines.append("};")
+        return "\n".join(lines)
+
+
 _NATIVE_BO = "<" if sys.byteorder == "little" else ">"
 _PTR_SIZE = ctypes.sizeof(ctypes.c_void_p)
 
@@ -476,6 +601,10 @@ def resolve_spec(tp) -> Spec:
     schema = getattr(tp, "__firstclass__", None) if isinstance(tp, type) else None
     if schema is not None:
         return Nested(schema)
+    if isinstance(tp, type) and issubclass(tp, enum.Enum):
+        # bare enum: like a C enum, 32-bit (signed only if some value is negative)
+        signed = any(isinstance(m.value, int) and m.value < 0 for m in tp)
+        return EnumSpec(tp, resolve_spec(int32_t if signed else uint32_t))
     return _ctypes_spec(tp) or Plain(tp)
 
 
@@ -515,6 +644,36 @@ class bytes_t:
         return Annotated[bytes, ByteArray(_positive(n))]
 
 
+class bitfield:
+    """`bitfield[uint8_t, 3]`: a 3-bit field stored in a uint8_t unit (C: `uint8_t x : 3`)."""
+
+    def __class_getitem__(cls, params):
+        try:
+            storage, bits = params
+        except (TypeError, ValueError):
+            raise TypeError("bitfield needs two params: bitfield[storage_type, bits]") from None
+        st = resolve_spec(storage)
+        if not isinstance(st, Scalar):
+            raise TypeError("bitfield storage must be an integer type like uint8_t")
+        return Annotated[int, BitField(st, _positive(bits))]
+
+
+class enum_t:
+    """`enum_t[Color, uint8_t]`: an int-valued Enum stored as the given integer type."""
+
+    def __class_getitem__(cls, params):
+        try:
+            enum_cls, storage = params
+        except (TypeError, ValueError):
+            raise TypeError("enum_t needs two params: enum_t[EnumClass, storage_type]") from None
+        if not (isinstance(enum_cls, type) and issubclass(enum_cls, enum.Enum)):
+            raise TypeError(f"{enum_cls!r} is not an Enum")
+        st = resolve_spec(storage)
+        if not isinstance(st, Scalar):
+            raise TypeError("enum storage must be an integer type like uint8_t")
+        return Annotated[enum_cls, EnumSpec(enum_cls, st)]
+
+
 class array_t:
     """`array_t[T, N]`: exactly N items of T (scalar, char_array, or firstclass class)."""
 
@@ -523,4 +682,7 @@ class array_t:
             elem, n = params
         except (TypeError, ValueError):
             raise TypeError("array_t needs two params: array_t[element_type, length]") from None
-        return Annotated[list, ArrayOf(resolve_spec(elem), _positive(n))]
+        spec = resolve_spec(elem)
+        if isinstance(spec, BitField):
+            raise TypeError("arrays of bitfields are not supported")
+        return Annotated[list, ArrayOf(spec, _positive(n))]
