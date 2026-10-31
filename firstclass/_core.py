@@ -211,8 +211,8 @@ class Schema:
             ]}
             if not self.aligned:
                 ns["_pack_"] = 1
-                if sys.version_info >= (3, 14):
-                    ns["_layout_"] = "ms"
+            if sys.version_info >= (3, 14):
+                ns["_layout_"] = "ms"  # our bitfield rules; also silences the _pack_ warning
             self._ctype = type(self.cls.__name__ + "_c", (base,), ns)
         return self._ctype
 
