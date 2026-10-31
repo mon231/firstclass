@@ -8,11 +8,12 @@ import sys
 import typing
 import xml.etree.ElementTree as ET
 
+from ._rustgen import rust_source
 from ._specs import ArrayOf, BitField, EnumSpec, Nested, Spec, resolve_spec
 
 _METHODS = (
     "to_bytes", "from_bytes", "unpack_from", "to_dict", "from_dict", "to_json", "from_json",
-    "to_xml", "from_xml", "to_ctypes", "from_ctypes", "ctypes_type", "c_header", "sizeof",
+    "to_xml", "from_xml", "to_ctypes", "from_ctypes", "ctypes_type", "c_header", "rust_source", "sizeof",
 )
 
 
@@ -31,6 +32,7 @@ class Schema:
         self._fields: list[tuple[dataclasses.Field, Spec]] | None = None
         self._layout = None
         self._ctype = None
+        self._spec_map = None
 
     # -- structure -----------------------------------------------------------
 
@@ -98,6 +100,31 @@ class Schema:
     @property
     def _by_name(self):
         return {f.name: f for f, _ in self.fields}  # small; fields are cached
+
+    @property
+    def spec_map(self):
+        if self._spec_map is None:
+            self._spec_map = {f.name: (f, spec) for f, spec in self.fields}
+        return self._spec_map
+
+    def validate_instance(self, obj):
+        """Check (and normalise) every field of a freshly built instance."""
+        for f, spec in self.fields:
+            if hasattr(obj, f.name):
+                try:
+                    value = spec.check(getattr(obj, f.name))
+                except (TypeError, ValueError) as e:
+                    raise self._ctx(f, e) from e
+                object.__setattr__(obj, f.name, value)
+
+    def checked_setattr(self, obj, name, value):
+        entry = self.spec_map.get(name)
+        if entry is not None:
+            try:
+                value = entry[1].check(value)
+            except (TypeError, ValueError) as e:
+                raise self._ctx(entry[0], e) from e
+        object.__setattr__(obj, name, value)
 
     def _ctx(self, f, exc):
         kind = TypeError if isinstance(exc, TypeError) else ValueError  # e.g. UnicodeDecodeError -> ValueError
@@ -231,7 +258,7 @@ class Schema:
         c = self.ctypes_type()()
         for f, spec in self.fields:
             try:
-                setattr(c, f.name, spec.to_c(getattr(obj, f.name)))
+                setattr(c, f.name, spec.to_c(getattr(obj, f.name), self.bo))
             except (TypeError, ValueError) as e:
                 raise self._ctx(f, e) from e
         return c
@@ -280,7 +307,9 @@ def firstclass(cls=None, /, *, byteorder: str = "little", align: bool = False, *
     """Like `@dataclass` (same keyword args), plus binary/JSON/XML/ctypes/C codecs.
 
     Unlike a plain dataclass, `order=True` is the default (compare field by field, like tuples);
-    pass `order=False` to turn it off.
+    pass `order=False` to turn it off. Values are validated when an instance is created and on
+    every attribute assignment: a field that cannot be encoded (out of range, too long, wrong type)
+    raises `ValueError` / `TypeError` immediately, never later in `to_bytes()`.
 
     byteorder: 'little' (default) or 'big'.
     align: False (default) = packed layout, no padding; True = natural C alignment padding.
@@ -291,12 +320,28 @@ def firstclass(cls=None, /, *, byteorder: str = "little", align: bool = False, *
             raise TypeError(f"@firstclass needs a class, got {type(cls).__name__}")
         kwargs = dict(dataclass_kwargs)
         kwargs.setdefault("order", kwargs.get("eq", True))  # ==, <, <=, >, >= by field order
+        holder = []
+        frozen = bool(kwargs.get("frozen"))
+        if frozen:  # frozen __init__ bypasses __setattr__, so validate once the instance is built
+            user_post = getattr(cls, "__post_init__", None)
+            if getattr(user_post, "_firstclass", False):
+                user_post = None  # inherited from a firstclass parent: already covered
+
+            def __post_init__(self, *args):
+                holder[0].validate_instance(self)
+                if user_post is not None:
+                    user_post(self, *args)
+            __post_init__._firstclass = True
+            cls.__post_init__ = __post_init__
         dc = dataclasses.dataclass(cls, **kwargs)
         clash = [f.name for f in dataclasses.fields(dc) if f.name in _METHODS or f.name == "__firstclass__"]
         if clash:
             raise TypeError(f"{dc.__name__}: field names clash with firstclass methods: {clash}")
         s = Schema(dc, byteorder, align)
         dc.__firstclass__ = s
+        holder.append(s)
+        if not frozen:  # every assignment (including those in __init__) is checked
+            dc.__setattr__ = lambda self, name, value: s.checked_setattr(self, name, value)
         dc.to_bytes = lambda self: s.pack(self)
         dc.from_bytes = staticmethod(s.from_bytes)
         dc.unpack_from = staticmethod(s.unpack_from)
@@ -310,6 +355,7 @@ def firstclass(cls=None, /, *, byteorder: str = "little", align: bool = False, *
         dc.from_ctypes = staticmethod(s.from_ctypes)
         dc.ctypes_type = staticmethod(s.ctypes_type)
         dc.c_header = staticmethod(s.c_header)
+        dc.rust_source = staticmethod(lambda: rust_source(s))
         dc.sizeof = staticmethod(s.size)
         return dc
 

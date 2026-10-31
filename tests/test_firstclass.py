@@ -97,17 +97,16 @@ class Bytes(unittest.TestCase):
 
     def test_char_array_errors(self):
         p = make_packet()
-        p.name = "toolong!"
         with self.assertRaises(ValueError):
-            p.to_bytes()
+            p.name = "toolong!"
         p.name = "exact!"
         self.assertEqual(Packet.from_bytes(p.to_bytes()).name, "exact!")
 
     def test_bytes_exact(self):
         p = make_packet()
-        p.mac = b"\x00"
         with self.assertRaises(ValueError):
-            p.to_bytes()
+            p.mac = b"\x00"
+        self.assertEqual(p.mac, b"\x01\x02\x03\x04")  # the rejected assignment changed nothing
 
     def test_wrong_length_in(self):
         with self.assertRaises(ValueError):

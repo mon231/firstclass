@@ -10,6 +10,11 @@ from typing import Annotated, Any, get_origin
 import xml.etree.ElementTree as ET
 
 
+def _endian(ctype, bo):
+    """The byte-swapped (or plain) variant of a ctypes simple type for struct byte order `bo`."""
+    return getattr(ctype, "__ctype_be__" if bo == ">" else "__ctype_le__", ctype)
+
+
 class Spec:
     """Base class. `bo` is a struct byte-order prefix: '<' or '>'."""
 
@@ -87,6 +92,11 @@ class Scalar(Spec):
         else:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise TypeError(f"{self.name} needs float, got {type(value).__name__}")
+            if self.fmt == "f":
+                try:
+                    struct.pack("<f", value)
+                except (OverflowError, struct.error) as e:
+                    raise ValueError(f"{value!r} does not fit {self.name}: {e}") from e
         return value
 
     def pack(self, value, bo):
@@ -117,9 +127,9 @@ class Scalar(Spec):
         return self.check(int(text) if self.kind == "int" else float(text))
 
     def ctype(self, bo):
-        return self._ctype
+        return _endian(self._ctype, bo)
 
-    def to_c(self, value):
+    def to_c(self, value, bo):
         return self.check(value)
 
     def from_c(self, cvalue):
@@ -176,7 +186,7 @@ class CharArray(Spec):
     def ctype(self, bo):
         return ctypes.c_char * self.n
 
-    def to_c(self, value):
+    def to_c(self, value, bo):
         return self._encode(value)
 
     def from_c(self, cvalue):
@@ -184,6 +194,78 @@ class CharArray(Spec):
 
     def c_decl(self, name):
         return f"char {name}[{self.n}]"
+
+
+class WCharArray(Spec):
+    """Fixed-size UTF-16 string: N two-byte units (like `wchar_t name[N]` on Windows), NUL-padded.
+
+    Characters outside the BMP take two units (a surrogate pair). The unit byte order follows the
+    containing class's byteorder.
+    """
+
+    def __init__(self, n: int):
+        self.n = n
+
+    def align(self):
+        return 2
+
+    def size(self):
+        return 2 * self.n
+
+    def _units(self, value) -> list[int]:
+        if not isinstance(value, str):
+            raise TypeError(f"wchar_array needs str, got {type(value).__name__}")
+        if "\0" in value:
+            raise ValueError("wchar_array value must not contain NUL")
+        raw = value.encode("utf-16-le")  # lone surrogates raise UnicodeEncodeError (a ValueError)
+        units = list(struct.unpack(f"<{len(raw) // 2}H", raw))
+        if len(units) > self.n:
+            raise ValueError(f"{value!r} is {len(units)} UTF-16 units, wchar_array[{self.n}] holds {self.n}")
+        return units
+
+    @staticmethod
+    def _text(units) -> str:
+        units = list(units)
+        end = units.index(0) if 0 in units else len(units)
+        return struct.pack(f"<{end}H", *units[:end]).decode("utf-16-le")
+
+    def check(self, value):
+        self._units(value)
+        return value
+
+    def pack(self, value, bo):
+        units = self._units(value)
+        units += [0] * (self.n - len(units))
+        return struct.pack(f"{bo}{self.n}H", *units)
+
+    def unpack(self, buf, off, bo):
+        return self._text(struct.unpack_from(f"{bo}{self.n}H", buf, off))
+
+    def to_json(self, value):
+        return value
+
+    def from_json(self, obj):
+        return self.check(obj)
+
+    def to_xml(self, value, elem):
+        elem.text = value
+
+    def from_xml(self, elem):
+        return self.check(_xml_text(elem))
+
+    def ctype(self, bo):
+        return _endian(ctypes.c_uint16, bo) * self.n  # c_wchar is 4 bytes on Linux: use raw 16-bit units
+
+    def to_c(self, value, bo):
+        units = self._units(value)
+        units += [0] * (self.n - len(units))
+        return self.ctype(bo)(*units)
+
+    def from_c(self, cvalue):
+        return self._text(cvalue)
+
+    def c_decl(self, name):
+        return f"uint16_t {name}[{self.n}]"
 
 
 class ByteArray(Spec):
@@ -232,7 +314,7 @@ class ByteArray(Spec):
     def ctype(self, bo):
         return ctypes.c_ubyte * self.n
 
-    def to_c(self, value):
+    def to_c(self, value, bo):
         return (ctypes.c_ubyte * self.n).from_buffer_copy(self.check(value))
 
     def from_c(self, cvalue):
@@ -290,12 +372,12 @@ class ArrayOf(Spec):
     def ctype(self, bo):
         return self.elem.ctype(bo) * self.n
 
-    def to_c(self, value):
-        arr = self.ctype(None)()
+    def to_c(self, value, bo):
+        arr = self.ctype(bo)()
         for i, v in enumerate(self.check(value)):
-            c = self.elem.to_c(v)
+            c = self.elem.to_c(v, bo)
             if isinstance(self.elem, CharArray):  # array items need an instance, not bytes
-                c = self.elem.ctype(None).from_buffer_copy(c.ljust(self.elem.n, b"\0"))
+                c = self.elem.ctype(bo).from_buffer_copy(c.ljust(self.elem.n, b"\0"))
             arr[i] = c
         return arr
 
@@ -344,7 +426,7 @@ class Nested(Spec):
     def ctype(self, bo):
         return self.schema.ctypes_type()
 
-    def to_c(self, value):
+    def to_c(self, value, bo):
         return self.schema.to_ctypes(self.check(value))
 
     def from_c(self, cvalue):
@@ -442,7 +524,7 @@ class BitField(Spec):
     def ctype(self, bo):
         return self.storage.ctype(bo)
 
-    def to_c(self, value):
+    def to_c(self, value, bo):
         return self.check(value)
 
     def from_c(self, cvalue):
@@ -500,7 +582,7 @@ class EnumSpec(Spec):
     def ctype(self, bo):
         return self.storage.ctype(bo)
 
-    def to_c(self, value):
+    def to_c(self, value, bo):
         return int(self.check(value).value)
 
     def from_c(self, cvalue):
@@ -536,7 +618,7 @@ class Pointer(Scalar):
             raise TypeError("ctypes pointers need the platform's native byteorder")
         return self.tp
 
-    def to_c(self, value):
+    def to_c(self, value, bo):
         value = self.check(value)
         if self.tp is ctypes.c_void_p:
             return value
@@ -628,6 +710,7 @@ float32_t = Annotated[float, Scalar("float32_t", "f", ctypes.c_float, "float", "
 float64_t = Annotated[float, Scalar("float64_t", "d", ctypes.c_double, "double", "float")]
 bool_t = Annotated[bool, Scalar("bool_t", "?", ctypes.c_bool, "bool", "bool")]
 char_t = Annotated[str, CharArray(1)]
+wchar_t = Annotated[str, WCharArray(1)]  # one 2-byte UTF-16 unit
 
 
 class char_array:
@@ -635,6 +718,13 @@ class char_array:
 
     def __class_getitem__(cls, n):
         return Annotated[str, CharArray(_positive(n))]
+
+
+class wchar_array:
+    """`wchar_array[N]`: UTF-16 string in N two-byte units (2*N bytes), NUL-padded."""
+
+    def __class_getitem__(cls, n):
+        return Annotated[str, WCharArray(_positive(n))]
 
 
 class bytes_t:

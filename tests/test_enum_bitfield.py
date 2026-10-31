@@ -139,9 +139,10 @@ class EnumTests(unittest.TestCase):
 
     def test_wrong_type_rejected(self):
         e = self.make()
-        e.color = 300  # plain int, not a member
         with self.assertRaises(TypeError):
-            e.to_bytes()
+            e.color = 300  # plain int, not a member
+        with self.assertRaises(TypeError):
+            Enums(300, Mode.ON, Perm.R, Signed.NEG, [Color.RED, Color.GREEN])
 
     def test_value_must_fit_storage(self):
         with self.assertRaises(ValueError):

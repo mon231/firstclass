@@ -358,8 +358,11 @@ class Nesting(unittest.TestCase):
             Mixed(LittleInner(1), {"v": 1}).to_bytes()
 
     def test_error_path_names_the_field(self):
-        with self.assertRaisesRegex(ValueError, "Mixed.little: LittleInner.v"):
-            Mixed(LittleInner(70000), BigInner(1)).to_bytes()
+        with self.assertRaisesRegex(ValueError, "LittleInner.v"):
+            Mixed(LittleInner(70000), BigInner(1))
+        m = Mixed(LittleInner(1), BigInner(1))
+        with self.assertRaisesRegex(TypeError, "Mixed.little"):
+            m.little = "not a LittleInner"
 
     def test_aligned_outer_with_aligned_inner(self):
         @firstclass(align=True)
@@ -529,6 +532,20 @@ class CtypesBridge(unittest.TestCase):
         self.assertEqual(Small.from_ctypes(c), Small(7, 8))
         c.a = 99
         self.assertEqual(buf[0], 99)
+
+    def test_big_endian_arrays_of_wide_scalars(self):
+        @firstclass(byteorder="big")
+        class BE:
+            words: array_t[uint16_t, 3]
+            floats: array_t[float32_t, 2]
+            grid: array_t[array_t[int32_t, 2], 2]
+            big: array_t[uint64_t, 1]
+            one: uint32_t
+        v = BE([1, 2, 0x0304], [1.5, -2.0], [[1, -2], [3, -4]], [2 ** 40], 0xA0B0C0D0)
+        c = v.to_ctypes()
+        self.assertEqual(bytes(c), v.to_bytes())
+        self.assertEqual(v.to_bytes()[:6], b"\x00\x01\x00\x02\x03\x04")
+        self.assertEqual(BE.from_ctypes(c), v)
 
     def test_ctypes_fields_validate(self):
         with self.assertRaises(ValueError):

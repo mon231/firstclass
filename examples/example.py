@@ -81,10 +81,14 @@ def define_in_python():
     # the C header for the other side of the wire
     print(Telemetry.c_header())
 
-    # errors are loud, never silent truncation
-    t.device = "way-too-long-name"
+    # values that cannot be encoded are rejected when the object is created or assigned,
+    # never silently truncated and never later at to_bytes() time
     try:
-        t.to_bytes()
+        t.device = "way-too-long-name"
+    except ValueError as e:
+        print("rejected:", e)
+    try:
+        Vec2(x=70000, y=0)
     except ValueError as e:
         print("rejected:", e)
 

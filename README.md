@@ -38,6 +38,7 @@ Packet.sizeof()                    # 36
 | `bool_t` | `bool` | 1 |
 | `char_t` | `char` | 1 |
 | `char_array[N]` | `char x[N]` | N (UTF-8, NUL-padded) |
+| `wchar_t` / `wchar_array[N]` | `uint16_t x[N]` | 2 (2*N), UTF-16, NUL-padded |
 | `bytes_t[N]` | `uint8_t x[N]` | N |
 | `array_t[T, N]` | `T x[N]` | N * size(T) |
 | `enum_t[Color, uint8_t]` | `uint8_t x` (+ `enum Color {..}` in header) | storage size |
@@ -77,6 +78,7 @@ address only means something inside the same process. Sizes follow the platform
 | `obj.to_xml(indent=None)` / `Cls.from_xml(s)` | `<Packet><kind>1</kind>...</Packet>`, arrays as `<item>` |
 | `obj.to_ctypes()` / `Cls.from_ctypes(c)` / `Cls.ctypes_type()` | `ctypes.Structure` with matching layout |
 | `Cls.c_header()` | C source for the struct(s), nested ones first |
+| `Cls.rust_source()` | Rust `#[repr(C)]` source for the struct(s) and enums |
 
 ## Import C/C++ headers
 
@@ -105,12 +107,59 @@ bitfields, inheritance, virtual members, unknown types (`#include`d headers are 
 Plain C enums are 32-bit like C unless `: type` is given. C field names that are Python keywords
 (`class`, `from`, ...) get a trailing underscore (`class_`).
 
+## Validation
+
+A value that cannot be encoded never becomes an instance. Fields are checked when the object is
+created and on every attribute assignment, so the mistake surfaces where it was made, not later in
+`to_bytes()`:
+
+```python
+Header(kind=300, tag="x")    # ValueError: Header.kind: 300 out of range for uint8_t [0, 255]
+Header(kind=1, tag="ab")     # ValueError: Header.tag: 'ab' is 2 bytes, char_array[1] holds 1
+h.name = "far too long"      # ValueError, and h.name keeps its old value
+```
+
+Wrong type -> `TypeError`, wrong value or size -> `ValueError`. Sequences and bytes-likes are
+normalised (`(1, 2)` becomes `[1, 2]`, `bytearray` becomes `bytes`) and copied. The one gap is
+mutating a container in place (`obj.nums[0] = 300`), which is not an assignment to the field;
+`to_bytes()` still refuses it. Applies to hand-written classes and to classes made by
+`from_header` / `from_rust`.
+
 ## Comparison
 
 Like a dataclass, `==` / `!=` compare field by field. Unlike a plain dataclass, ordering is on by
 default: `<`, `<=`, `>`, `>=` compare fields in declaration order, like tuples, so you can `sorted()`,
 `min()` and `max()` instances. Comparing with another class raises `TypeError` (`==` is just `False`).
 Switch it off with `@firstclass(order=False)`; `eq=False` turns off both.
+
+## Rust
+
+```python
+from firstclass import from_rust
+
+t = from_rust("src/protocol.rs")            # or from_rust(text="...")
+t.Header, t.Status, t.constants, t.skipped  # same result object as from_header
+print(t.Header.rust_source())               # and back: any firstclass class -> Rust definitions
+```
+
+`from_rust` reads simple `#[repr(C)]` structs (C layout with padding) and `#[repr(C, packed)]`
+structs (no padding), plus C-like enums with `#[repr(u8)]`, `#[repr(i32)]` or `#[repr(C)]` and
+plain discriminants (constant expressions, `as` casts, `const`s allowed). Types: `u8`..`u64`,
+`i8`..`i64`, `usize`, `isize`, `f32`, `f64`, `bool`, `c_int` and the other `c_*` names, `[T; N]`
+(`N` may be a `const` expression), nested structs, type aliases, tuple structs, raw pointers,
+references, `Box`, `Option<&T>` and `fn` pointers (stored as addresses). `[u8; N]` becomes
+`bytes_t[N]`, `[c_char; N]` becomes `char_array[N]`, `wchar_t` the 2-byte UTF-16 types. Modules are
+flattened and `#[cfg(test)]` items are ignored.
+
+Skipped with a reason in `.skipped`: structs without `#[repr(C)]` (Rust may reorder their fields;
+pass `assume_repr_c=True` to read them anyway), `repr(transparent)`, `repr(align(N))`,
+`packed(N)` for N > 1, generics, unions, `char`, `u128`, `String`/`Vec`/slices/tuples, enums with
+data. Options: `byteorder`, `align`, `assume_repr_c`, `long_size`.
+
+`Cls.rust_source()` writes `#[repr(C)]` / `#[repr(C, packed)]` structs, `#[repr(u8)]` enums,
+`[u8; N]` for strings and bytes, `[u16; N]` for wide strings, `*mut c_void` for pointers and
+`r#` for keyword names. Rust has no bitfields, so each group of bitfields becomes one integer
+field with the member names in a comment.
 
 ## Layout options
 

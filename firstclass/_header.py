@@ -891,6 +891,8 @@ class _Builder:
             sc = _named_scalar(w)
             if sc:
                 return sc, False, []
+            if w in ("wchar_t", "char16_t"):  # always the 2-byte UTF-16 unit
+                return ("wchar",), False, []
         if words[0] in ("struct", "union", "enum") and len(words) == 2:
             if words[0] == "union":
                 raise _Skip("union unsupported")
@@ -982,6 +984,8 @@ class _Builder:
             return S.bool_t
         if kind == "char":
             return S.char_t
+        if kind == "wchar":
+            return S.wchar_t
         if kind == "struct":
             return self.struct(base[1])
         if kind == "enum":
@@ -1007,6 +1011,8 @@ class _Builder:
         last = dims.pop()
         if not ptr and base == ("char",):
             elem = S.char_array[last]
+        elif not ptr and base == ("wchar",):
+            elem = S.wchar_array[last]
         elif not ptr and base == ("int", 8, False):
             elem = S.bytes_t[last]
         else:
@@ -1016,34 +1022,8 @@ class _Builder:
         return elem
 
 
-def from_header(path=None, *, text=None, byteorder: str = "little", align: bool | None = None,
-                defines: dict | None = None, long_size: int | None = None) -> HeaderTypes:
-    """Parse a C/C++ header (`path`, or source `text=`) into firstclass classes.
-
-    structs/classes become `@firstclass` dataclasses, enums/enum classes become `IntEnum`s.
-    Layout follows the C rules: natural alignment padding, unless the struct is
-    `#pragma pack(1)` / `__attribute__((packed))`. Override with `align=True/False`.
-    `defines` presets macros; `long_size` is the size of C `long` (default: this machine's).
-    Things that cannot be represented are listed in the result's `.skipped`.
-    """
-    if (path is None) == (text is None):
-        raise TypeError("pass exactly one of path or text=")
-    if path is not None:
-        text = Path(os.fspath(path)).read_text(encoding="utf-8", errors="replace")
-    if byteorder not in ("little", "big"):
-        raise ValueError(f"byteorder must be 'little' or 'big', got {byteorder!r}")
-    long_size = long_size or ctypes.sizeof(ctypes.c_long)
-    ctx = _Ctx(long_size)
-    pre = _Preprocessor(defines)
-    toks = _fold_attributes(pre.run(text, ctx))
-    _Parser(toks, ctx).parse_all()
-    for name, body in pre.macros.items():  # integer #defines are constants too
-        if name not in ctx.constants:
-            try:
-                ctx.constants[name] = ctx.eval(pre.expand(body, (name,)))
-            except (_ExprError, ValueError, KeyError):
-                pass
-
+def _assemble(ctx, byteorder, align) -> HeaderTypes:
+    """Build classes for everything the parser collected."""
     builder = _Builder(ctx, byteorder, align)
     result = HeaderTypes()
     result.constants = dict(ctx.constants)
@@ -1076,3 +1056,34 @@ def from_header(path=None, *, text=None, byteorder: str = "little", align: bool 
         elif base[1] in result.skipped:
             result.skipped[name] = result.skipped[base[1]]
     return result
+
+
+def from_header(path=None, *, text=None, byteorder: str = "little", align: bool | None = None,
+                defines: dict | None = None, long_size: int | None = None) -> HeaderTypes:
+    """Parse a C/C++ header (`path`, or source `text=`) into firstclass classes.
+
+    structs/classes become `@firstclass` dataclasses, enums/enum classes become `IntEnum`s.
+    Layout follows the C rules: natural alignment padding, unless the struct is
+    `#pragma pack(1)` / `__attribute__((packed))`. Override with `align=True/False`.
+    `defines` presets macros; `long_size` is the size of C `long` (default: this machine's).
+    Things that cannot be represented are listed in the result's `.skipped`.
+    """
+    if (path is None) == (text is None):
+        raise TypeError("pass exactly one of path or text=")
+    if path is not None:
+        text = Path(os.fspath(path)).read_text(encoding="utf-8", errors="replace")
+    if byteorder not in ("little", "big"):
+        raise ValueError(f"byteorder must be 'little' or 'big', got {byteorder!r}")
+    long_size = long_size or ctypes.sizeof(ctypes.c_long)
+    ctx = _Ctx(long_size)
+    pre = _Preprocessor(defines)
+    toks = _fold_attributes(pre.run(text, ctx))
+    _Parser(toks, ctx).parse_all()
+    for name, body in pre.macros.items():  # integer #defines are constants too
+        if name not in ctx.constants:
+            try:
+                ctx.constants[name] = ctx.eval(pre.expand(body, (name,)))
+            except (_ExprError, ValueError, KeyError):
+                pass
+
+    return _assemble(ctx, byteorder, align)

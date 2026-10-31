@@ -42,6 +42,16 @@ class PackedBasics(unittest.TestCase):
         self.assertEqual(h.to_bytes(), struct.pack("<BHiQfd?c", 7, 513, -5, 2 ** 40, 1.5, 2.25, True, b"z"))
         self.assertEqual(t.Header.from_bytes(h.to_bytes()), h)
 
+    def test_values_that_do_not_fit_are_rejected_on_creation(self):
+        t = from_header(text=self.H)
+        ok = (7, 513, -5, 2 ** 40, 1.5, 2.25, True, "z")
+        t.Header(*ok)
+        for index, bad in ((7, "ab"), (7, "\u20ac"), (0, 256), (1, 70000), (2, 2 ** 31), (3, -1), (6, 1)):
+            args = list(ok)
+            args[index] = bad
+            with self.assertRaises((TypeError, ValueError), msg=f"field {index} = {bad!r}"):
+                t.Header(*args)  # must fail here, not later in to_bytes()
+
     def test_big_endian_option(self):
         t = from_header(text=self.H, byteorder="big")
         h = t.Header(1, 2, 3, 4, 0.5, 0.25, False, "q")
