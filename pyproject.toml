@@ -10,5 +10,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/mon231/firstclass"
+Repository = "https://github.com/mon231/firstclass"
+Issues = "https://github.com/mon231/firstclass/issues"
+
 [tool.setuptools]
 packages = ["firstclass"]
