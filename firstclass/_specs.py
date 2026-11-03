@@ -22,12 +22,17 @@ class Spec:
     """Base class. `bo` is a struct byte-order prefix: '<' or '>'."""
 
     binary = True
+    variable = False  # True for the string specs: no fixed size, no fixed offsets
 
     def align(self) -> int:
         raise NotImplementedError
 
     def size(self) -> int:
         raise NotImplementedError
+
+    def unpack_seq(self, buf, off: int, bo: str):
+        """(value, bytes consumed); the default reads one fixed-size value."""
+        return self.unpack(buf, off, bo), self.size()
 
     def check(self, value: Any) -> Any:
         """Validate (and normalise) a python value; raises TypeError/ValueError."""
@@ -335,6 +340,7 @@ class ArrayOf(Spec):
     def __init__(self, elem: Spec, n: int):
         self.elem, self.n = elem, n
         self.binary = elem.binary
+        self.variable = elem.variable
 
     def align(self):
         return self.elem.align()
@@ -355,6 +361,15 @@ class ArrayOf(Spec):
     def unpack(self, buf, off, bo):
         step = self.elem.size()
         return [self.elem.unpack(buf, off + i * step, bo) for i in range(self.n)]
+
+    def unpack_seq(self, buf, off, bo):
+        if not self.variable:  # fixed array of fixed elements: one size() step each
+            return super().unpack_seq(buf, off, bo)
+        values, cur = [], off
+        for _ in range(self.n):
+            v, cur = self.elem.unpack_seq(buf, cur, bo)
+            values.append(v)
+        return values, cur - off
 
     def to_json(self, value):
         return [self.elem.to_json(v) for v in value]
@@ -440,43 +455,108 @@ class Nested(Spec):
     def c_decl(self, name):
         return f"struct {self.schema.cls.__name__} {name}"
 
+    @property
+    def variable(self):
+        return self.schema.variable
 
-class Plain(Spec):
-    """Un-annotated field: JSON/XML only, no binary form."""
 
-    binary = False
+class _StringSpec(Spec):
+    """One of the four string specs (`NullTerminatedString`, `SizedString`, and the wide ones).
 
-    def __init__(self, tp):
-        self.tp = tp
+    `wide` = one 2-byte UTF-16 unit per TCHAR (like `wchar_array`); otherwise one one-byte
+    UTF-8 char. `terminated` = a NUL terminator instead of a uint32 length prefix. The length
+    prefix and the units follow the containing class's byteorder.
+    """
+
+    binary = True
+    variable = True
+
+    def __init__(self, name: str, wide: bool, terminated: bool):
+        self.name = name
+        self.wide = wide
+        self.terminated = terminated
+
+    def align(self):
+        return 1
+
+    def size(self):
+        raise TypeError(f"{self.name} has no fixed size")
+
+    def _units(self, value):
+        """Validate a str; return its content as bytes (narrow) or a list of code units (wide)."""
+        if not isinstance(value, str):
+            raise TypeError(f"{self.name} needs str, got {type(value).__name__}")
+        if "\0" in value:
+            raise ValueError(f"{self.name} value must not contain NUL")
+        raw = value.encode("utf-16-le" if self.wide else "utf-8")  # lone surrogates raise UnicodeEncodeError (a ValueError)
+        if not self.wide:
+            return raw
+        return list(struct.unpack(f"<{len(raw) // 2}H", raw))
 
     def check(self, value):
+        self._units(value)
         return value
+
+    def pack(self, value, bo):
+        payload = self._units(value)
+        if not self.wide:
+            data, tail = bytes(payload), b"\x00" if self.terminated else b""
+            prefix = b"" if self.terminated else struct.pack(bo + "I", len(data))
+        else:
+            data = struct.pack(f"{bo}{len(payload)}H", *payload)
+            tail = struct.pack(bo + "H", 0) if self.terminated else b""
+            prefix = b"" if self.terminated else struct.pack(bo + "I", len(payload))
+        return prefix + data + tail
+
+    def unpack_seq(self, buf, off, bo):
+        """(text, bytes consumed): length prefixes are read, terminated strings are scanned."""
+        if not self.terminated:
+            if len(buf) - off < 4:
+                raise ValueError(f"{self.name} wants a uint32 length prefix, got {len(buf) - off} bytes")
+            count = struct.unpack_from(bo + "I", buf, off)[0]
+            seen = len(buf) - off - 4
+            width = 2 if self.wide else 1
+            if seen < count * width:
+                raise ValueError(f"{self.name} wants {count * width} bytes, got {max(seen, 0)}")
+            start = off + 4
+            if not self.wide:
+                return bytes(buf[start:start + count]).decode("utf-8"), 4 + count
+            units = struct.unpack_from(f"{bo}{count}H", buf, start)
+            return struct.pack(f"<{count}H", *units).decode("utf-16-le"), 4 + 2 * count
+        if not self.wide:
+            end = bytes(buf[off:]).find(b"\x00")
+            if end == -1:
+                raise ValueError(f"{self.name} has no NUL terminator")
+            return bytes(buf[off:off + end]).decode("utf-8"), end + 1
+        units, cur = [], off
+        while cur + 2 <= len(buf):
+            unit = struct.unpack_from(bo + "H", buf, cur)[0]
+            if unit == 0:
+                return struct.pack(f"<{len(units)}H", *units).decode("utf-16-le"), cur - off + 2
+            units.append(unit)
+            cur += 2
+        raise ValueError(f"{self.name} has no NUL terminator")
 
     def to_json(self, value):
         return value
 
     def from_json(self, obj):
-        return obj
+        return self.check(obj)
 
     def to_xml(self, value, elem):
-        if self.tp is bool:
-            elem.text = "true" if value else "false"
-        elif self.tp in (int, float, str):
-            elem.text = str(value) if self.tp is not float else repr(value)
-        else:
-            raise TypeError(f"XML needs a firstclass type for {self.tp!r}")
+        elem.text = value
 
     def from_xml(self, elem):
-        text = _xml_text(elem)
-        if self.tp is bool:
-            if text.strip() not in ("true", "false"):
-                raise ValueError(f"bad bool text {text!r}")
-            return text.strip() == "true"
-        if self.tp in (int, float):
-            return self.tp(text.strip())
-        if self.tp is str:
-            return text
-        raise TypeError(f"XML needs a firstclass type for {self.tp!r}")
+        return self.check(_xml_text(elem))
+
+    def __repr__(self):
+        return self.name
+
+
+NullTerminatedString = _StringSpec("NullTerminatedString", wide=False, terminated=True)
+SizedString = _StringSpec("SizedString", wide=False, terminated=False)
+NullTerminatedWString = _StringSpec("NullTerminatedWString", wide=True, terminated=True)
+SizedWString = _StringSpec("SizedWString", wide=True, terminated=False)
 
 
 class BitField(Spec):
@@ -685,6 +765,8 @@ def resolve_spec(tp) -> Spec:
         for meta in tp.__metadata__:
             if isinstance(meta, Spec):
                 return meta
+    if isinstance(tp, _StringSpec):
+        return tp
     schema = getattr(tp, "__firstclass__", None) if isinstance(tp, type) else None
     if schema is not None:
         return Nested(schema)
@@ -692,7 +774,21 @@ def resolve_spec(tp) -> Spec:
         # bare enum: like a C enum, 32-bit (signed only if some value is negative)
         signed = any(isinstance(m.value, int) and m.value < 0 for m in tp)
         return EnumSpec(tp, resolve_spec(int32_t if signed else uint32_t))
-    return _ctypes_spec(tp) or Plain(tp)
+    spec = _ctypes_spec(tp)
+    if spec is not None:
+        return spec
+    if tp is bool:  # bare Python scalar annotations map to a real type (never silently unvalidated)
+        return resolve_spec(bool_t)
+    if tp is int:
+        return resolve_spec(int32_t)
+    if tp is float:
+        return resolve_spec(float64_t)
+    if tp is str:
+        return NullTerminatedString
+    raise TypeError(
+        f"type {tp!r} has no binary form; annotate it with uint8_t, char_array[N], "
+        "bytes_t[N], NullTerminatedString, ... or a firstclass class"
+    )
 
 
 def _positive(n) -> int:

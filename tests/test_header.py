@@ -340,7 +340,7 @@ class NestedAndPointers(unittest.TestCase):
         struct { uint8_t p; uint8_t q; } anon;
         struct Node *next;
         void *user;
-        char *text;
+        int *things;
         callback_t cb;
         void (*handler)(int);
         size_t len;
@@ -369,7 +369,7 @@ class NestedAndPointers(unittest.TestCase):
 
         class Ref(ctypes.Structure):
             _fields_ = [("first", Inner), ("list", Inner * 2), ("anon", Anon), ("next", ctypes.c_void_p),
-                        ("user", ctypes.c_void_p), ("text", ctypes.c_void_p), ("cb", ctypes.c_void_p),
+                        ("user", ctypes.c_void_p), ("things", ctypes.c_void_p), ("cb", ctypes.c_void_p),
                         ("handler", ctypes.c_void_p), ("len", ctypes.c_size_t), ("big", ctypes.c_long),
                         ("ubig", ctypes.c_ulong), ("ll", ctypes.c_longlong), ("s", ctypes.c_short),
                         ("u", ctypes.c_uint)]

@@ -60,7 +60,7 @@ def _enum_definition(spec: S.EnumSpec) -> str:
 
 
 def rust_source(schema) -> str:
-    schema.require_binary()
+    schema.require_fixed("written as Rust source")
     out, seen = [], set()
 
     def emit(sc):

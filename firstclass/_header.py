@@ -879,6 +879,10 @@ class _Builder:
         """words -> (base, is_pointer, inner_dims)"""
         ctx = self.ctx
         # `std::uint64_t` / `ns::Type` -> last component
+        if words[:2] == ("std", "::") and len(words) == 3:  # std::string / std::wstring: dynamic C++ strings
+            kind = {"string": "string", "wstring": "wstring"}.get(words[2])
+            if kind:
+                return (kind,), False, []
         words = tuple(w for i, w in enumerate(words)
                       if w != "::" and not (i + 1 < len(words) and words[i + 1] == "::"))
         if depth > 16 or not words:
@@ -929,6 +933,37 @@ class _Builder:
         self.structs[name] = cls
         return cls
 
+    _STRING_POINTERS = {("char",): S.SizedString, ("wchar",): S.SizedWString}
+
+    @staticmethod
+    def _is_length_member(len_name, ptr_name):
+        return len_name in ("len", "length", "size") or \
+            len_name in tuple(ptr_name + "_" + s for s in ("len", "length", "size"))
+
+    def _pair_strings(self, decl):
+        """A uint32_t member named like the pointer's <name>_len/_length/_size (or len/size/length),
+        immediately before a wide/narrow string pointer: the two become ONE Sized* string field
+        (the length member is consumed; its bytes are the sized prefix's own)."""
+        consumed, sized = set(), {}
+        fields = decl.fields
+        for i in range(1, len(fields)):
+            f, prev = fields[i], fields[i - 1]
+            try:
+                base, ptr, inner = self.lower(f.words)
+            except _Skip:
+                continue
+            if base not in self._STRING_POINTERS or not (ptr or f.ptr) or f.dims or inner or f.bits is not None:
+                continue
+            try:
+                lbase, lptr, linner = self.lower(prev.words)
+            except _Skip:
+                continue
+            if lbase == ("int", 32, False) and not lptr and not linner and not prev.dims and prev.bits is None \
+                    and self._is_length_member(prev.name, f.name):
+                consumed.add(prev.name)
+                sized[f.name] = self._STRING_POINTERS[base]
+        return consumed, sized
+
     def _build_struct(self, decl):
         if decl.reason:
             raise _Skip(decl.reason)
@@ -941,17 +976,24 @@ class _Builder:
         if self.align is not None:
             aligned = self.align
         ann = {}
+        consumed, sized = self._pair_strings(decl)
         for f in decl.fields:
+            if f.name in consumed:
+                continue  # paired length member: gone into the sized string field
             if f.name in ann:
                 raise _Skip(f"duplicate field {f.name}")
             try:
                 # C names that are Python keywords (class, from, ...) get a trailing underscore
-                ann[f.name + "_" if keyword.iskeyword(f.name) else f.name] = self.annotation(f)
+                ann[f.name + "_" if keyword.iskeyword(f.name) else f.name] = \
+                    sized.get(f.name) or self.annotation(f)
             except (_Skip, TypeError, ValueError) as e:
                 raise _Skip(f"{decl.name}.{f.name}: {e}") from None
+        if aligned and any(getattr(v, "variable", False) for v in ann.values()):
+            aligned = False  # string members end the fixable-layout regime: pack instead of optional padding
         cls = type(decl.name, (), {"__annotations__": ann, "__module__": "firstclass.header"})
         cls = firstclass(byteorder=self.byteorder, align=aligned)(cls)
-        cls.sizeof()  # validates the layout now rather than at first use
+        if not cls.__firstclass__.variable:
+            cls.sizeof()  # validates the layout now rather than at first use
         return cls
 
     def enum(self, name):
@@ -993,6 +1035,10 @@ class _Builder:
             return S.char_t
         if kind == "wchar":
             return S.wchar_t
+        if kind == "string":
+            return S.NullTerminatedString
+        if kind == "wstring":
+            return S.NullTerminatedWString
         if kind == "struct":
             return self.struct(base[1])
         if kind == "enum":
@@ -1009,6 +1055,10 @@ class _Builder:
             if base[0] != "int" or ptr or dims:
                 raise _Skip("bitfield needs a plain integer type")
             return S.bitfield[_INTS[(base[1], base[2])], f.bits]
+        if ptr and not dims and base in self._STRING_POINTERS:
+            raise _Skip(
+                "char*/wchar_t*/char16_t* is only supported as a pair with a preceding uint32 "
+                "_len/_length/_size member (the string is packed inline, not as an address)")
         ann = ctypes.c_void_p if ptr else self.base_annotation(base)
         if not dims:
             return ann

@@ -30,6 +30,7 @@ class Schema:
         self.byteorder = byteorder
         self.aligned = align
         self._fields: list[tuple[dataclasses.Field, Spec]] | None = None
+        self._variable = None
         self._layout = None
         self._ctype = None
         self._spec_map = None
@@ -39,17 +40,49 @@ class Schema:
     @property
     def fields(self):
         if self._fields is None:
-            hints = typing.get_type_hints(self.cls, include_extras=True)
-            self._fields = [(f, resolve_spec(hints[f.name])) for f in dataclasses.fields(self.cls)]
+            # deferred creation path (module-level forward reference): the checks must still run
+            self.resolve_fields()
         return self._fields
 
-    def require_binary(self):
-        for f, spec in self.fields:
+    def resolve_fields(self):
+        """Resolve every annotation and run the creation-time checks; cached into self._fields."""
+        hints = typing.get_type_hints(self.cls, include_extras=True)
+        fields, variables = [], []
+        for f in dataclasses.fields(self.cls):
+            hint = hints[f.name]
+            spec = resolve_spec(hint)
             if not spec.binary:
                 raise TypeError(
-                    f"{self.cls.__name__}.{f.name}: type {spec.tp!r} has no binary form; "
-                    "annotate it with uint8_t, char_array[N], ... or a firstclass class"
+                    f"{self.cls.__name__}.{f.name}: type {hint!r} has no binary form; "
+                    "annotate it with uint8_t, char_array[N], bytes_t[N], NullTerminatedString, ... "
+                    "or a firstclass class"
                 )
+            if spec.variable:
+                variables.append(f.name)
+            if isinstance(spec, Nested) and spec.schema.variable:
+                raise TypeError(
+                    f"{self.cls.__name__}.{f.name}: {spec.schema.cls.__name__} has variable-length fields "
+                    "and cannot become a field of another class"
+                )
+            fields.append((f, spec))
+        self._fields = fields
+        if variables:
+            if self.aligned:
+                raise TypeError(
+                    f"{self.cls.__name__}: variable-length fields {', '.join(variables)} cannot be used with align=True")
+            self._variable = True
+
+    def require_fixed(self, what: str):
+        """Raise if this class contains a variable-length field (sizeof/ctypes/C/Rust refuse those)."""
+        if self.variable:
+            names = ", ".join(f.name for f, spec in self.fields if getattr(spec, "variable", False))
+            raise TypeError(f"{self.cls.__name__}: variable-length fields {names} cannot be {what}")
+
+    @property
+    def variable(self):
+        if self._variable is None:
+            self._variable = any(spec.variable for _, spec in self.fields)
+        return self._variable
 
     def layout(self):
         """-> (items, total_size, widest_alignment).
@@ -57,7 +90,6 @@ class Schema:
         An item is ("field", index, offset) or ("bits", storage_spec, offset, [(index, shift, bits)]).
         """
         if self._layout is None:
-            self.require_binary()
             msb = self.bo == ">"
             off, widest, items, group = 0, 1, [], None  # group = [storage, used_bits, members]
             for i, (_, spec) in enumerate(self.fields):
@@ -84,6 +116,7 @@ class Schema:
         return self._layout
 
     def size(self) -> int:
+        self.require_fixed("measured with sizeof()")
         return self.layout()[1]
 
     def align(self) -> int:
@@ -132,7 +165,76 @@ class Schema:
 
     # -- bytes ---------------------------------------------------------------
 
+    def _pack_variable(self, obj) -> bytes:
+        """Sequential packing for classes with variable-length fields: no offsets, no padding."""
+        msb = self.bo == ">"
+        order = "little" if self.bo == "<" else "big"
+        chunks, group = [], None  # group = [storage_spec, used_bits, value]
+        fields = self.fields
+        for i, (f, spec) in enumerate(fields):
+            if not isinstance(spec, BitField):
+                group = None
+                try:
+                    chunks.append(spec.pack(getattr(obj, f.name), self.bo))
+                except (TypeError, ValueError) as e:
+                    raise self._ctx(f, e) from e
+                continue
+            st = spec.storage
+            unit_width = st.size() * 8
+            if group is None or group[0].size() != st.size() or group[1] + spec.bits > unit_width:
+                if group is not None:  # storage changed or the unit is full: emit it before the new one
+                    chunks.append(group[2].to_bytes(group[0].size(), order))
+                group = [st, 0, 0]
+            shift = unit_width - group[1] - spec.bits if msb else group[1]
+            try:
+                value = spec.check(getattr(obj, f.name))
+            except (TypeError, ValueError) as e:
+                raise self._ctx(f, e) from e
+            group[2] |= (value & ((1 << spec.bits) - 1)) << shift
+            group[1] += spec.bits
+            nxt = fields[i + 1][1] if i + 1 < len(fields) else None
+            if not (isinstance(nxt, BitField) and nxt.storage.size() == st.size()):
+                chunks.append(group[2].to_bytes(st.size(), order))
+                group = None
+        return b"".join(chunks)
+
+    def _unpack_variable(self, buf, off: int):
+        """Sequential unpacking: string lengths come from the bytes themselves."""
+        order = "little" if self.bo == "<" else "big"
+        msb = self.bo == ">"
+        fields = self.fields
+        kw, cur, group = {}, off, None  # group = [storage_spec, unit, used_bits]
+        for i, (f, spec) in enumerate(fields):
+            if isinstance(spec, BitField):
+                st = spec.storage
+                if group is None or group[0].size() != st.size() or group[2] + spec.bits > st.size() * 8:
+                    if group is not None:  # storage changed or the unit is full: consume it before the next
+                        cur += group[0].size()
+                    raw = bytes(buf[cur:cur + st.size()])
+                    if len(raw) < st.size():
+                        raise ValueError(f"{self.cls.__name__} data ends in the middle of a bitfield unit")
+                    group = [st, int.from_bytes(raw, order), 0]
+                shift = st.size() * 8 - group[2] - spec.bits if msb else group[2]
+                v = (group[1] >> shift) & ((1 << spec.bits) - 1)
+                if spec.signed and v >> (spec.bits - 1):
+                    v -= 1 << spec.bits
+                kw[f.name] = v
+                group[2] += spec.bits
+                nxt = fields[i + 1][1] if i + 1 < len(fields) else None
+                if not (isinstance(nxt, BitField) and nxt.storage.size() == st.size()):
+                    cur += st.size()
+                    group = None
+                continue
+            try:
+                kw[f.name], used = spec.unpack_seq(buf, cur, self.bo)
+            except (TypeError, ValueError) as e:
+                raise self._ctx(f, e) from e
+            cur += used
+        return self._build(kw)
+
     def pack(self, obj) -> bytes:
+        if self.variable:
+            return self._pack_variable(obj)
         items, total, _ = self.layout()
         buf = bytearray(total)
         order = "little" if self.bo == "<" else "big"
@@ -157,6 +259,8 @@ class Schema:
         return bytes(buf)
 
     def unpack(self, buf, off: int = 0):
+        if self.variable:
+            return self._unpack_variable(buf, off)
         items, total, _ = self.layout()
         if len(buf) - off < total:
             raise ValueError(f"{self.cls.__name__} needs {total} bytes, got {len(buf) - off}")
@@ -192,6 +296,8 @@ class Schema:
 
     def from_bytes(self, data):
         data = self._as_bytes_like(data)
+        if self.variable:  # no fixed size: read the fields, trailing bytes are fine
+            return self.unpack(data, 0)
         if len(data) != self.size():
             raise ValueError(f"{self.cls.__name__} needs exactly {self.size()} bytes, got {len(data)}")
         return self.unpack(data, 0)
@@ -240,7 +346,7 @@ class Schema:
 
     def ctypes_type(self):
         if self._ctype is None:
-            self.require_binary()
+            self.require_fixed("built as a ctypes structure")
             base = ctypes.LittleEndianStructure if self.bo == "<" else ctypes.BigEndianStructure
             ns = {"_fields_": [
                 (f.name, spec.ctype(self.bo), spec.bits) if isinstance(spec, BitField)
@@ -264,6 +370,7 @@ class Schema:
         return c
 
     def from_ctypes(self, c):
+        self.require_fixed("converted from ctypes data")
         return self._build({f.name: spec.from_c(getattr(c, f.name)) for f, spec in self.fields})
 
     def _nested_schemas(self):
@@ -274,7 +381,7 @@ class Schema:
                 yield spec.schema
 
     def c_header(self) -> str:
-        self.require_binary()
+        self.require_fixed("described in a C header")
         out, seen = [], set()
 
         def emit(schema):
@@ -304,12 +411,23 @@ class Schema:
 
 
 def firstclass(cls=None, /, *, byteorder: str = "little", align: bool = False, **dataclass_kwargs):
-    """Like `@dataclass` (same keyword args), plus binary/JSON/XML/ctypes/C codecs.
+    """Like `@dataclass` (same keyword args), plus binary/JSON/XML/ctypes/C/Rust codecs.
 
     Unlike a plain dataclass, `order=True` is the default (compare field by field, like tuples);
     pass `order=False` to turn it off. Values are validated when an instance is created and on
     every attribute assignment: a field that cannot be encoded (out of range, too long, wrong type)
     raises `ValueError` / `TypeError` immediately, never later in `to_bytes()`.
+
+    Annotations are resolved when the class is defined: every field needs a binary form
+    (`uint8_t`, `char_array[N]`, `array_t`, the string types, ... another `firstclass` class).
+    Bare annotations are mapped once at definition — `str` to `NullTerminatedString`, `int` to
+    `int32_t`, `float` to `float64_t`, `bool` to `bool_t` — and anything without a binary form
+    (`Path`, `List[str]`, `object`, ...) raises `TypeError` at class definition, never later.
+
+    Classes containing the variable-length string types (`NullTerminatedString`, `SizedString`,
+    `NullTerminatedWString`, `SizedWString`) have no fixed size: they work as instances, but
+    `sizeof()`, the ctypes conversions, `c_header()` and `rust_source()` raise `TypeError`, and the
+    class can neither be nested nor used with `align=True`.
 
     byteorder: 'little' (default) or 'big'.
     align: False (default) = packed layout, no padding; True = natural C alignment padding.
@@ -338,6 +456,10 @@ def firstclass(cls=None, /, *, byteorder: str = "little", align: bool = False, *
         if clash:
             raise TypeError(f"{dc.__name__}: field names clash with firstclass methods: {clash}")
         s = Schema(dc, byteorder, align)
+        try:
+            s.resolve_fields()  # checks at class definition; never a later silent no-validation field
+        except NameError:
+            pass  # forward reference to a later name: same checks run on first use
         dc.__firstclass__ = s
         holder.append(s)
         if not frozen:  # every assignment (including those in __init__) is checked

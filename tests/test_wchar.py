@@ -194,7 +194,7 @@ class FromHeader(unittest.TestCase):
                 char16_t title[2];
                 wchar_t single;
                 wchar_t grid[2][3];
-                wchar_t *ptr;
+                void *ptr;
             };
         """, align=False)
         self.assertEqual(t.skipped, {})

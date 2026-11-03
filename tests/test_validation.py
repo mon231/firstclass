@@ -4,7 +4,9 @@ import copy
 import ctypes
 import dataclasses
 import enum
+import pathlib
 import pickle
+import typing
 import unittest
 
 from firstclass import (
@@ -324,13 +326,32 @@ class OtherDataclassFeatures(unittest.TestCase):
         with self.assertRaises(ValueError):
             Plain(300)
 
-    def test_plain_typed_fields_are_not_checked(self):
+    def test_unsupported_types_throw_at_class_definition(self):
+        with self.assertRaises(TypeError):
+            @firstclass
+            class HasPath:
+                p: pathlib.Path
+        with self.assertRaises(TypeError):
+            @firstclass
+            class HasList:
+                x: typing.List[str]
+        with self.assertRaises(TypeError):
+            @firstclass
+            class HasObject:
+                o: object
+
+    def test_bare_scalars_map_to_real_types_and_are_checked(self):
         @firstclass
         class Loose:
             a: uint8_t
             label: str = "x"
-            anything: object = None
-        Loose(1, 5, [1, 2])
+        with self.assertRaises(TypeError):
+            Loose(1, 5)  # bare str is a NullTerminatedString now: wrong type is checked
+        loose = Loose(1, "fine")
+        self.assertEqual(loose.to_bytes(), b"\x01" + b"fine\x00")
+        with self.assertRaises(TypeError):
+            loose.label = 9
+        self.assertEqual(loose.label, "fine")
 
     def test_ordering_and_equality_unaffected(self):
         self.assertTrue(Inner(1) < Inner(2))

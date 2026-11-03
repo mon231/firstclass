@@ -136,9 +136,9 @@ class Bytes(unittest.TestCase):
         self.assertEqual(W.from_bytes(w.to_bytes()), w)
         self.assertEqual(W.sizeof(), 1 + 2 + 4 + 8 + 1 + 2 + 4 + 8 + 8 + 1)
 
-    def test_plain_field_no_binary(self):
-        with self.assertRaisesRegex(TypeError, "Loose.label"):
-            Loose(1).to_bytes()
+    def test_plain_str_becomes_null_terminated_string(self):
+        self.assertEqual(Loose(1).to_bytes(), b"\x01" + b"x\x00")
+        self.assertEqual(Loose.from_bytes(b"\x01" + b"x\x00"), Loose(1))
 
 
 class Dataclass(unittest.TestCase):

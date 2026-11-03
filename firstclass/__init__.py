@@ -15,6 +15,10 @@ from ._specs import (
     int16_t,
     int32_t,
     int64_t,
+    NullTerminatedString,
+    NullTerminatedWString,
+    SizedString,
+    SizedWString,
     uint8_t,
     uint16_t,
     uint32_t,
@@ -29,6 +33,7 @@ __all__ = [
     "int8_t", "int16_t", "int32_t", "int64_t",
     "float32_t", "float64_t", "bool_t", "char_t",
     "char_array", "wchar_t", "wchar_array", "bytes_t", "array_t", "bitfield", "enum_t",
+    "NullTerminatedString", "SizedString", "NullTerminatedWString", "SizedWString",
 ]
 
 firstclass.from_header = from_header  # also reachable as the decorator's attribute

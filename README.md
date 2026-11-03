@@ -39,6 +39,10 @@ Packet.sizeof()                    # 36
 | `char_t` | `char` | 1 |
 | `char_array[N]` | `char x[N]` | N (UTF-8, NUL-padded) |
 | `wchar_t` / `wchar_array[N]` | `uint16_t x[N]` | 2 (2*N), UTF-16, NUL-padded |
+| `NullTerminatedString` | `std::string` (from headers) | content bytes + one NUL |
+| `SizedString` | paired `uint32_t len; char *s` | uint32 count + content bytes |
+| `NullTerminatedWString` | `std::wstring` (from headers) | code units + one NUL unit |
+| `SizedWString` | paired `uint32_t len; wchar_t *s` | uint32 units + code units |
 | `bytes_t[N]` | `uint8_t x[N]` | N |
 | `array_t[T, N]` | `T x[N]` | N * size(T) |
 | `enum_t[Color, uint8_t]` | `uint8_t x` (+ `enum Color {..}` in header) | storage size |
@@ -47,6 +51,14 @@ Packet.sizeof()                    # 36
 
 Values are checked: out of range ints, over-long strings and wrong lengths raise
 `ValueError`; wrong Python types raise `TypeError`. Nothing is truncated or coerced silently.
+Bare annotations are mapped to real types once at class definition, never on values:
+
+| bare annotation | becomes |
+|---|---|
+| `str` | `NullTerminatedString` |
+| `int` | `int32_t` |
+| `float` | `float64_t` |
+| `bool` | `bool_t` |
 
 **Enums.** Int-valued `Enum`/`IntEnum`/`IntFlag` classes. `enum_t[Color, uint8_t]` picks the width;
 a bare `Color` annotation is 32-bit like a C `int` (unsigned unless a value is negative). Values
@@ -66,11 +78,22 @@ Raw `ctypes` types work as annotations too (packed, same layout as a `_pack_ = 1
 address only means something inside the same process. Sizes follow the platform
 (`c_long` is 4 bytes on Windows, 8 on Linux).
 
+**Strings.** Four types for content of any length: `NullTerminatedString` (UTF-8 bytes + one NUL
+byte — this is what a plain `str` field is), `SizedString` (a uint32 UTF-8 byte-count prefix in the
+class's byteorder + the content), and the wide variants `NullTerminatedWString` / `SizedWString`
+(UTF-16 code units, two bytes each; the wide count is in code units). A string holding a NUL (or
+any zero code unit) is refused. Such fields are created, validated, compared and pickled like any
+other, but the class has no fixed size, so `sizeof()`, the ctypes conversions, `c_header()` and
+`rust_source()` raise `TypeError`, and the class can neither be nested nor used with `align=True`
+(both throw at class definition). Instance bytes are written field by field with no padding;
+`unpack_from` reads one object at an offset as usual, and `from_bytes` accepts trailing bytes (an
+exact size is unknowable). A truncated or unterminated buffer raises `ValueError` naming the field.
+
 ## Methods added to every class
 
 | Method | |
 |---|---|
-| `obj.to_bytes()` / `Cls.from_bytes(data)` | binary; `from_bytes` needs exactly `sizeof()` bytes |
+| `obj.to_bytes()` / `Cls.from_bytes(data)` | binary; fixed-size classes: `from_bytes` needs exactly `sizeof()` bytes. Variable-length classes (strings) read one object like `unpack_from` |
 | `Cls.unpack_from(buffer, offset=0)` | like `struct.unpack_from`: read one object at `offset`, trailing bytes are fine; any buffer type |
 | `Cls.sizeof()` | size in bytes |
 | `obj.to_dict()` / `Cls.from_dict(d)` | JSON-compatible dict (bytes as hex) |
@@ -95,15 +118,26 @@ t.skipped                                   # {"name": "reason"} for anything no
 Understood: `struct`/`class`/`typedef struct`, nested and anonymous-member structs, `enum` and
 `enum class : type` (explicit values, implicit increments, constant expressions), bitfields, arrays
 (multi-dimensional, sizes from `#define`/enum/`const`/`sizeof`), `char[N]` -> `char_array`,
-`uint8_t[N]` -> `bytes_t`, pointers and function pointers (stored as addresses), `typedef`/`using`,
+`uint8_t[N]` -> `bytes_t`, `std::string`/`std::wstring` -> `NullTerminatedString`/`NullTerminatedWString`,
+pointers and function pointers (stored as addresses), `typedef`/`using`,
 `#define`/`#if`/`#ifdef`/`#elif` (preset macros with `defines={...}`), `namespace`, `extern "C"`,
 `#pragma pack(push/pop/N)` and `__attribute__((packed))`. Layout follows C: natural alignment
-padding unless the struct is packed; force it with `align=True/False`. Options: `byteorder`,
+padding unless the struct is packed; force it with `align=True/False` (a struct holding a paired
+inline string is always packed — a variable-length member has no fixed position to pad around).
+Options: `byteorder`,
 `long_size` (size of C `long`; default is this machine's).
+
+A `uint32_t` member named `<name>_len`, `<name>_length`, `<name>_size` (or literally `len`,
+`length`, `size`) immediately before `char *name` / `wchar_t *name` / `char16_t *name` pairs with
+it into one `SizedString`/`SizedWString` field: the length member is consumed as the prefix, and
+the C struct's pointer member is serialised inline as `uint32` length + content when the class is
+packed.
 
 Skipped with a reason instead of failing: unions, flexible array members, unnamed padding
 bitfields, inheritance, virtual members, unknown types (`#include`d headers are not read), `pack(2)`
-/`pack(4)`, `aligned(N)`, `long double`, empty structs, anything depending on a skipped struct.
+/`pack(4)`, `aligned(N)`, `long double`, empty structs, anything depending on a skipped struct, and
+unpaired `char *`/`wchar_t *`/`char16_t *` pointers (pair one with a preceding `uint32_t <name>_len`
+member, or size the string instead: `char name[N]`).
 Plain C enums are 32-bit like C unless `: type` is given. C field names that are Python keywords
 (`class`, `from`, ...) get a trailing underscore (`class_`).
 
@@ -124,6 +158,10 @@ normalised (`(1, 2)` becomes `[1, 2]`, `bytearray` becomes `bytes`) and copied. 
 mutating a container in place (`obj.nums[0] = 300`), which is not an assignment to the field;
 `to_bytes()` still refuses it. Applies to hand-written classes and to classes made by
 `from_header` / `from_rust`.
+
+Type problems are caught even earlier: every annotation resolves when the class is defined. A field
+annotated with something that has no binary form (`pathlib.Path`, `typing.List[str]`, `object`, ...)
+raises `TypeError` at class definition — no field can ever silently skip validation.
 
 ## Comparison
 
@@ -176,9 +214,9 @@ in a comment.
 
 ## Notes
 
-- Fields with plain types (`str`, `int`) work for JSON/XML only; `to_bytes()` raises
-  `TypeError` naming the field.
-- Use `from __future__ import annotations` freely; annotations are resolved lazily. Classes
+- Use `from __future__ import annotations` freely; annotations resolve at class definition, or on
+  first use for a forward reference to a name defined later in the module (the checks run whenever
+  they resolve — never silently skipped). Classes
   defined inside functions that refer to local names are not resolvable.
 - Don't parse untrusted XML with `from_xml` without extra care (stdlib `xml.etree`).
 - Field names that collide with the generated methods (`to_bytes`, ...) raise `TypeError`.
